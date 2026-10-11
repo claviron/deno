@@ -1,0 +1,101 @@
+[package]
+autotests = false
+name = "claviron-deno"
+version = "0.2.0-alpha.16"
+publish = ["de02"]
+edition = "2024"
+description = "Claviron's slim persistent JavaScript application runtime"
+
+[features]
+default = []
+# Optional vhost composition; plain Axum mounting does not need an edge.
+edge = ["server", "claviron/edge"]
+cache = ["server", "claviron/cache"]
+tasks = ["server", "claviron/tasks"]
+# Declared log channels: `claviron:log` and its LogTape sink.
+log = ["server", "claviron/log-pipeline"]
+fetch = [
+    "dep:deno_fetch",
+    "dep:deno_net",
+    "dep:deno_permissions",
+    "dep:deno_telemetry",
+    "dep:deno_tls",
+    "dep:sys_traits",
+]
+orbit = ["server", "claviron/orbit"]
+postgres = [
+    "server",
+    "dep:futures-util",
+    "dep:sqlx",
+    "claviron/postgres",
+    "claviron/server",
+    "sqlx/json",
+    "sqlx/postgres",
+]
+mysql = [
+    "postgres",
+    "claviron/mysql",
+    "sqlx/mysql",
+]
+server = [
+    "dep:async-trait",
+    "dep:axum",
+    "dep:claviron",
+    "claviron/application",
+    "claviron/axum",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:serde_yaml",
+    "dep:tracing",
+]
+tls = ["server", "fetch", "claviron/tls"]
+websocket = [
+    "server",
+    "claviron/websocket",
+    "dep:fastwebsockets",
+    "dep:hyper",
+    "dep:hyper-util",
+]
+
+[dependencies]
+
+claviron = { path = "../claviron", version = "0.2.0-alpha.16", registry = "de02", default-features = false, optional = true }
+
+# Stay within compatible Deno API lines, without imposing extra exact pins.
+# Upstream Deno crates may still pin their own dependencies (including rustls).
+deno_ast = { version = "0.53", features = ["transpiling"] }
+deno_core = { version = "0.412", default-features = false, features = ["reactor-tokio", "v8", "v8_use_custom_libcxx"] }
+deno_crypto = "0.273"
+deno_error = "0.7"
+deno_fetch = { version = "0.283", optional = true }
+deno_net = { version = "0.251", optional = true }
+deno_permissions = { version = "0.118", optional = true }
+deno_telemetry = { version = "0.81", optional = true }
+deno_tls = { version = "0.246", optional = true }
+
+async-trait = { version = "0.1", optional = true }
+axum = { version = "0.8", optional = true }
+
+bytes = "1"
+deno_web = "0.290"
+deno_webidl = "0.259"
+futures-util = { version = "0.3", optional = true }
+fastwebsockets = { version = "0.10", optional = true }
+http = { version = "1", optional = true }
+http-body = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", features = ["server", "http2", "http1", "client"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http2", "http1"], optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+serde_yaml = { version = "0.9", optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "macros", "migrate", "json", "uuid", "time", "bigdecimal"], optional = true }
+sys_traits = { version = "0.1", features = ["libc", "real"], optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
