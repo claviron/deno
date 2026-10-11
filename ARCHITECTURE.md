@@ -163,6 +163,17 @@ resulting shared event without depending on the application's serialized host
 command mailbox. It has no replay guarantee; timeout or receiver lag returns
 `null`.
 
+Callback subscriptions and one-shot waits declare their domain topics through
+the process's existing `LinkInterest`. This is the same interest contract as
+PHP and standalone Orbit JS: Link forwards only topics with live consumers,
+not every application event. The first callback for a topic declares it; the
+last unsubscribe withdraws it. Each waiter holds a separate interest guard
+until delivery, timeout or cancellation, so it cannot withdraw a callback's
+or another isolate's declaration. Isolate teardown releases its declarations.
+The task inbox and one-shot receiver filter topic and application target at
+publication, before unrelated events can occupy their bounded queues.
+No new event loop, capacity, poll or retry duration is introduced.
+
 ## TypeScript and packages
 
 The slim loader accepts JavaScript, JSX, TypeScript and TSX local modules.

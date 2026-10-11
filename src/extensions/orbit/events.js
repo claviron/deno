@@ -28,13 +28,17 @@ function subscribe(topic, listener) {
     }
     let topicListeners = listeners.get(topic);
     if (topicListeners === undefined) {
+        core.ops.op_claviron_orbit_event_subscribe(topic);
         topicListeners = new Set();
         listeners.set(topic, topicListeners);
     }
     topicListeners.add(listener);
     return () => {
-        topicListeners.delete(listener);
+        if (!topicListeners.delete(listener)) {
+            return;
+        }
         if (topicListeners.size === 0) {
+            core.ops.op_claviron_orbit_event_unsubscribe(topic);
             listeners.delete(topic);
         }
     };
@@ -66,7 +70,7 @@ async function waitFor(topic, timeoutMs = 0) {
     // Opening the cursor is synchronous and deliberately precedes the first
     // await. A caller can create this promise, trigger external work, and know
     // an event published immediately by that work cannot race the subscription.
-    const handle = core.ops.op_claviron_orbit_event_wait_begin();
+    const handle = core.ops.op_claviron_orbit_event_wait_begin(topic);
     const event = await core.ops.op_claviron_orbit_event_wait({handle, topic, timeoutMs});
     return event === null ? null : JSON.parse(event, revive);
 }

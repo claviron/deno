@@ -12,6 +12,7 @@ use claviron::app::{
 use claviron::orbit::lock::{
     LockAcquire, LockKey, LockOwner, LockType, OrbitLock,
 };
+use claviron::orbit::transport::{InterestGuard, LinkInterest};
 use claviron::orbit::{
     Cells, CellsProvider, Counter, CounterProvider, FleetProvider,
     InvocationBus, InvocationProvider,
@@ -68,17 +69,14 @@ struct OrbitContext {
     application: ApplicationId,
     counter_provider: Arc<CounterProvider>,
     events: ProcessEventBus,
-    event_waiters:
-        Arc<Mutex<HashMap<u32, broadcast::Receiver<ApplicationEvent>>>>,
+    event_waiters: Arc<Mutex<HashMap<u32, EventWaiter>>>,
+    subscriptions: Arc<Mutex<EventSubscriptions>>,
     next_event_waiter: Arc<AtomicU32>,
     fleet_provider: Arc<FleetProvider>,
     /// This isolate's own place in the application event stream.
     ///
-    /// Opened when the isolate is built rather than when JavaScript first asks
-    /// for an event, so a task that publishes on its way up cannot miss what
-    /// arrives before its listener is registered. An isolate that never listens
-    /// simply never reads it; the channel drops its oldest entries and costs a
-    /// bounded number of retained events.
+    /// Admission follows the isolate's live topic subscriptions; unrelated
+    /// events cannot exhaust a task's inbox before it next receives.
     inbox: Arc<tokio::sync::Mutex<broadcast::Receiver<ApplicationEvent>>>,
     lock: Arc<Mutex<Option<OrbitLock>>>,
     cells_provider: Option<Arc<CellsProvider>>,
@@ -138,6 +136,70 @@ impl CellWaits {
         self.interrupted.store(true, Ordering::SeqCst);
         for (cells, id) in self.parked.lock().unwrap().values() {
             cell::wake_waiters(cells, id);
+        }
+    }
+}
+
+/// A callback subscription owns one Link declaration per topic. One-shot
+/// waiters own independent guards, so neither can withdraw the other's topic.
+struct EventSubscriptions {
+    interest: Option<Arc<LinkInterest>>,
+    topics: HashMap<String, Option<InterestGuard>>,
+}
+
+impl EventSubscriptions {
+    fn new(interest: Option<Arc<LinkInterest>>) -> Self {
+        Self { interest, topics: HashMap::new() }
+    }
+
+    fn declare(
+        &self,
+        topic: &str,
+    ) -> Option<InterestGuard> {
+        self.interest.as_ref().map(|interest| interest.add([topic]))
+    }
+
+    fn subscribe(
+        &mut self,
+        topic: String,
+    ) {
+        if !self.topics.contains_key(&topic) {
+            let guard = self.declare(&topic);
+            self.topics.insert(topic, guard);
+        }
+    }
+
+    fn unsubscribe(
+        &mut self,
+        topic: &str,
+    ) {
+        self.topics.remove(topic);
+    }
+}
+
+struct EventWaiter {
+    receiver: broadcast::Receiver<ApplicationEvent>,
+    _interest: Option<InterestGuard>,
+}
+
+impl EventWaiter {
+    fn new(
+        events: &ProcessEventBus,
+        application: ApplicationId,
+        topic: String,
+        interest: Option<&Arc<LinkInterest>>,
+    ) -> Self {
+        let selected = topic.clone();
+        let receiver =
+            events.subscribe_filtered(move |event: &ApplicationEvent| {
+                event.topic().as_str() == selected
+                    && event
+                        .target()
+                        .is_none_or(|target| target == &application)
+            });
+        Self {
+            receiver,
+            _interest: interest.map(|interest| interest.add([topic])),
         }
     }
 }
@@ -404,9 +466,19 @@ pub struct OrbitExtension {
     fleet_provider: Arc<FleetProvider>,
     cells_provider: Option<Arc<CellsProvider>>,
     invocation_provider: Option<Arc<InvocationProvider>>,
+    link_interest: Option<Arc<LinkInterest>>,
 }
 
 impl OrbitExtension {
+    /// Bind topic declarations to the process's existing Link bridges.
+    pub fn with_link_interest(
+        mut self,
+        interest: Option<Arc<LinkInterest>>,
+    ) -> Self {
+        self.link_interest = interest;
+        self
+    }
+
     pub fn new(
         counter_provider: Arc<CounterProvider>,
         fleet_provider: Arc<FleetProvider>,
@@ -418,6 +490,7 @@ impl OrbitExtension {
             fleet_provider,
             cells_provider: None,
             invocation_provider: None,
+            link_interest: None,
         }
     }
 
@@ -476,7 +549,36 @@ fn op_claviron_orbit_event_node_id(state: &OpState) -> Result<u32, JsErrorBox> {
 }
 
 #[op2(fast)]
-fn op_claviron_orbit_event_wait_begin(state: &OpState) -> u32 {
+fn op_claviron_orbit_event_subscribe(
+    state: &OpState,
+    #[string] topic: String,
+) {
+    state
+        .borrow::<OrbitContext>()
+        .subscriptions
+        .lock()
+        .unwrap()
+        .subscribe(topic);
+}
+
+#[op2(fast)]
+fn op_claviron_orbit_event_unsubscribe(
+    state: &OpState,
+    #[string] topic: String,
+) {
+    state
+        .borrow::<OrbitContext>()
+        .subscriptions
+        .lock()
+        .unwrap()
+        .unsubscribe(&topic);
+}
+
+#[op2(fast)]
+fn op_claviron_orbit_event_wait_begin(
+    state: &OpState,
+    #[string] topic: String,
+) -> u32 {
     let context = state.borrow::<OrbitContext>();
     let mut waiters = context.event_waiters.lock().unwrap();
     let handle = loop {
@@ -485,7 +587,14 @@ fn op_claviron_orbit_event_wait_begin(state: &OpState) -> u32 {
             break handle;
         }
     };
-    waiters.insert(handle, context.events.subscribe());
+    let interest = context.subscriptions.lock().unwrap().interest.clone();
+    let waiter = EventWaiter::new(
+        &context.events,
+        context.application.clone(),
+        topic,
+        interest.as_ref(),
+    );
+    waiters.insert(handle, waiter);
     handle
 }
 
@@ -496,7 +605,7 @@ async fn op_claviron_orbit_event_wait(
     #[serde] request: EventWaitRequest,
 ) -> Result<Option<String>, JsErrorBox> {
     let context = state.borrow().borrow::<OrbitContext>().clone();
-    let mut receiver = context
+    let mut waiter = context
         .event_waiters
         .lock()
         .unwrap()
@@ -514,12 +623,14 @@ async fn op_claviron_orbit_event_wait(
     loop {
         let received = match deadline {
             Some(deadline) => {
-                match tokio::time::timeout_at(deadline, receiver.recv()).await {
+                match tokio::time::timeout_at(deadline, waiter.receiver.recv())
+                    .await
+                {
                     Ok(received) => received,
                     Err(_) => return Ok(None),
                 }
             }
-            None => receiver.recv().await,
+            None => waiter.receiver.recv().await,
         };
         match received {
             Ok(event)
@@ -750,6 +861,8 @@ deno_core::extension!(
         op_claviron_orbit_counter_reset,
         op_claviron_orbit_event_node_id,
         op_claviron_orbit_event_publish,
+        op_claviron_orbit_event_subscribe,
+        op_claviron_orbit_event_unsubscribe,
         op_claviron_orbit_event_receive,
         op_claviron_orbit_event_take,
         op_claviron_orbit_event_wait,
@@ -796,18 +909,35 @@ impl ExtensionFactory for OrbitExtension {
         &self,
         context: ExtensionContext,
     ) -> Extension {
+        let application = ApplicationId::new(
+            ApplicationRuntime::new("js")
+                .expect("static JavaScript runtime identity"),
+            ApplicationName::new(context.application_name())
+                .expect("validated JavaScript application name"),
+        );
+        let subscriptions = Arc::new(Mutex::new(EventSubscriptions::new(
+            self.link_interest.clone(),
+        )));
+        let selected = Arc::downgrade(&subscriptions);
+        let target = application.clone();
+        let inbox =
+            self.events.subscribe_filtered(move |event: &ApplicationEvent| {
+                selected.upgrade().is_some_and(|selected| {
+                    selected
+                        .lock()
+                        .unwrap()
+                        .topics
+                        .contains_key(event.topic().as_str())
+                }) && event
+                    .target()
+                    .is_none_or(|application| application == &target)
+            });
         claviron_orbit_extension::init(OrbitContext {
-            application: ApplicationId::new(
-                ApplicationRuntime::new("js")
-                    .expect("static JavaScript runtime identity"),
-                ApplicationName::new(context.application_name())
-                    .expect("validated JavaScript application name"),
-            ),
+            application,
             counter_provider: Arc::clone(&self.counter_provider),
             event_waiters: Arc::new(Mutex::new(HashMap::new())),
-            inbox: Arc::new(tokio::sync::Mutex::new(
-                self.events.subscribe::<ApplicationEvent>(),
-            )),
+            inbox: Arc::new(tokio::sync::Mutex::new(inbox)),
+            subscriptions,
             events: self.events.clone(),
             next_event_waiter: Arc::new(AtomicU32::new(1)),
             fleet_provider: Arc::clone(&self.fleet_provider),

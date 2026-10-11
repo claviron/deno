@@ -896,6 +896,11 @@ pub(crate) fn configured_extensions(
         // them still gets the modules, which then report themselves absent.
         let orbit =
             OrbitExtension::new(counter, fleet, _state.events().bus().clone())
+                .with_link_interest(
+                    _state
+                        .registry_ref()
+                        .resolve::<claviron::orbit::transport::LinkInterest>(),
+                )
                 .with_cells(
                     _state
                         .registry_ref()
