@@ -258,7 +258,8 @@ fn decode(
         "JSON" | "JSONB" => DatabaseValue::Json(
             row.try_get::<sqlx::types::Json<serde_json::Value>, _>(index)?.0,
         ),
-        "CHAR" | "NAME" | "TEXT" | "VARCHAR" | "BPCHAR" | "UNKNOWN" => {
+        "CHAR" | "NAME" | "TEXT" | "VARCHAR" | "BPCHAR" | "UNKNOWN" | "citext"
+        | "CITEXT" => {
             DatabaseValue::String(row.try_get(index)?)
         }
         _ => {
