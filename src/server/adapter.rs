@@ -146,7 +146,9 @@ impl JsApplicationAdapter {
 }
 
 /// Fetch needs an absolute URL; the Rust request keeps its original URI.
-fn application_url(parts: &http::request::Parts) -> crate::Result<String> {
+pub(super) fn application_url(
+    parts: &http::request::Parts
+) -> crate::Result<String> {
     use http::uri::{Authority, Scheme};
 
     let scheme = request_scheme(&parts.extensions)

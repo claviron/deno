@@ -23,7 +23,7 @@ use super::JsApplicationService;
 use super::pool::WebSocketLease;
 use crate::application::{WebSocketAction, WebSocketMessage};
 
-/// Connects one exact H1 WebSocket route to a persistent JS application pool.
+/// Connects an exact WebSocket route to a persistent JS application pool.
 pub struct JsWebSocketUpgradeHandler {
     service: Arc<JsApplicationService>,
     application: Arc<str>,
@@ -35,6 +35,106 @@ impl JsWebSocketUpgradeHandler {
         application: impl Into<Arc<str>>,
     ) -> Self {
         Self { service, application: application.into() }
+    }
+
+    /// RFC 8441 on the same snapshot-owned route as the H1 upgrade. The
+    /// admitted CONNECT stays CONNECT and never enters the Fetch adapter.
+    #[cfg(feature = "edge")]
+    pub(crate) async fn handle_connect(
+        &self,
+        state: AppState,
+        request: Request<claviron::http::RouteBody>,
+    ) -> claviron::http::RouteResponse {
+        use claviron::http::session::SessionSpawner;
+        use claviron::http::{empty_body, err_status};
+        use http::StatusCode;
+
+        if !request.extensions().get::<hyper::ext::Protocol>().is_some_and(
+            |protocol| protocol.as_str().eq_ignore_ascii_case("websocket"),
+        ) || request
+            .headers()
+            .get(http::header::SEC_WEBSOCKET_VERSION)
+            .and_then(|value| value.to_str().ok())
+            != Some("13")
+        {
+            return err_status(StatusCode::BAD_REQUEST);
+        }
+        let Some(sessions) =
+            request.extensions().get::<SessionSpawner>().cloned()
+        else {
+            tracing::error!(application = %self.application, "JavaScript CONNECT request missing session owner");
+            return err_status(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let (parts, body) = request.into_parts();
+        let url = match super::adapter::application_url(&parts) {
+            Ok(url) => match url.strip_prefix("https:") {
+                Some(rest) => format!("wss:{rest}"),
+                None => format!(
+                    "ws:{}",
+                    url.strip_prefix("http:").expect("validated HTTP scheme")
+                ),
+            },
+            Err(error) => {
+                tracing::error!(application = %self.application, %error, "JavaScript CONNECT URL unavailable");
+                return err_status(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        let lease = match self.service.prepare_websocket(&self.application) {
+            Ok(lease) => lease,
+            Err(error) => {
+                debug!(application = %self.application, %error, "JavaScript CONNECT rejected");
+                return err_status(websocket_error_status(&error));
+            }
+        };
+        let headers = header_pairs(&parts.headers);
+        let request = Request::from_parts(parts, body);
+        let owner = sessions.clone();
+        let submitted = sessions.spawn(async move {
+            let upgraded = tokio::select! {
+                biased;
+                _ = owner.wait_graceful_shutdown() => return,
+                result = hyper::upgrade::on(request) => match result {
+                    Ok(upgraded) => upgraded,
+                    Err(error) => {
+                        debug!(%error, "JavaScript H2 CONNECT upgrade failed");
+                        return;
+                    }
+                }
+            };
+            let _session = claviron::runtime::activity::ACTIVITY.open_session();
+            if let Err(error) = serve_websocket_with_shutdown(
+                upgraded,
+                state,
+                url,
+                headers,
+                lease,
+                owner.wait_graceful_shutdown(),
+            )
+            .await
+            {
+                debug!(%error, "JavaScript H2 WebSocket ended with an error");
+            }
+        });
+        if let Err(error) = submitted {
+            debug!(%error, "JavaScript CONNECT session hand-off rejected");
+            return err_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        // Extended CONNECT uses 200, not 101, and has no H1 accept/key headers.
+        http::Response::builder()
+            .status(StatusCode::OK)
+            .body(empty_body())
+            .expect("static CONNECT response")
+    }
+}
+
+fn websocket_error_status(error: &crate::Error) -> http::StatusCode {
+    match error {
+        crate::Error::ApplicationNotRunning(_)
+        | crate::Error::RequestChannelClosed
+        | crate::Error::WebSocketUnavailable(_) => {
+            http::StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => http::StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -59,13 +159,11 @@ impl H1UpgradeHandler for JsWebSocketUpgradeHandler {
         let headers = websocket_response_headers(ctx, None)
             .map_err(|error| H1UpgradeReject::bad_request(error.to_string()))?;
         let lease = self.service.prepare_websocket(&self.application).map_err(
-            |error| match error {
-                crate::Error::ApplicationNotRunning(_)
-                | crate::Error::RequestChannelClosed
-                | crate::Error::WebSocketUnavailable(_) => {
-                    H1UpgradeReject::service_unavailable(error.to_string())
-                }
-                _ => H1UpgradeReject::internal(error.to_string()),
+            |error| {
+                H1UpgradeReject::new(
+                    websocket_error_status(&error),
+                    Some(error.to_string()),
+                )
             },
         )?;
         Ok(H1UpgradeAccept::with_state(headers, lease))
@@ -90,9 +188,16 @@ impl H1UpgradeHandler for JsWebSocketUpgradeHandler {
             .map(str::to_owned)
             .unwrap_or_else(|| ctx.host.to_string());
         let url = format!("wss://{host}{}", ctx.uri);
-        serve_websocket(upgraded, state, url, header_pairs(&ctx.headers), lease)
-            .await
-            .map_err(|error| RegistryError::recoverable(error.to_string()))
+        serve_websocket_with_shutdown(
+            upgraded,
+            state,
+            url,
+            header_pairs(&ctx.headers),
+            lease,
+            ctx.sessions.wait_graceful_shutdown(),
+        )
+        .await
+        .map_err(|error| RegistryError::recoverable(error.to_string()))
     }
 }
 
@@ -121,6 +226,26 @@ pub async fn serve_websocket(
     headers: Vec<(String, String)>,
     lease: WebSocketLease,
 ) -> crate::Result<()> {
+    serve_websocket_with_shutdown(
+        upgraded,
+        state,
+        url,
+        headers,
+        lease,
+        std::future::pending(),
+    )
+    .await
+}
+
+async fn serve_websocket_with_shutdown(
+    upgraded: Upgraded,
+    state: AppState,
+    url: String,
+    headers: Vec<(String, String)>,
+    lease: WebSocketLease,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> crate::Result<()> {
+    tokio::pin!(shutdown);
     let label = url.clone();
     let mut session = lease.open(url, headers).await?;
     let max_message_size = session.max_message_size();
@@ -134,6 +259,10 @@ pub async fn serve_websocket(
 
     let (close, notify_application) = loop {
         tokio::select! {
+            _ = &mut shutdown => {
+                let _ = socket.write_frame(Frame::close(1001, b"listener stopping")).await;
+                break ((1001, "listener stopping".to_owned(), true), true);
+            }
             action = session.recv() => {
                 match action {
                     Some(WebSocketAction::Text(text)) => {

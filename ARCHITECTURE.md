@@ -102,7 +102,8 @@ With the optional `websocket` feature, the same default-exported application
 object may also expose `websocket.open(socket)`,
 `websocket.message(socket, data)`, and
 `websocket.close(socket, code, reason, wasClean)`. Hyper performs the H1
-upgrade and `fastwebsockets` owns frame I/O on a Tokio task; the V8 isolate
+upgrade or H2 extended CONNECT and `fastwebsockets` owns frame I/O on a
+listener-owned Tokio task; the V8 isolate
 never owns a network stream. A connection is pinned to one application
 instance, while open/message/close events enter that instance through its
 bounded command mailbox. Consequently, an idle socket does not occupy the
@@ -307,6 +308,8 @@ example.test:
   transport:
     h1:
       upgrade: true
+    h2:
+      connect_protocol: true
   routes:
     /api:
       js:
@@ -316,14 +319,21 @@ example.test:
 ```
 
 Flat `js: { application: example }` binds the implicit `/` owner. With the
-`websocket` feature, declared exact H1 endpoints are mounted relative to that
+`websocket` feature, declared exact endpoints are mounted relative to that
 owner (`/api/socket` above). The compiler wraps its router with the existing
-Claviron H1 upgrade middleware and a candidate-local registry; failed or
-repeated preparation never mutates live bindings. Listener-owned session
-handoff, cancellation and graceful drain remain the existing transport's job.
+Claviron H1 upgrade middleware and a candidate-local registry. The same exact
+bindings accept H2 WebSockets when `transport.h2.connect_protocol` is enabled.
+The H2 hand-off is local to this router snapshot, preserving its ordinary
+policy layers; no live global CONNECT binding is mutated during preparation.
+Failed or repeated preparation never mutates live bindings. Extended CONNECT
+must carry protocol `websocket` and WebSocket version 13; it returns 200 with
+no H1 upgrade/accept headers. Its method and URI are never rewritten for Fetch.
+Both entrances reserve an instance through `prepare_websocket` and run the same
+WebSocket event/frame loop through the listener's `SessionSpawner`. Native drain
+sends close 1001; no private deadline or detached task is introduced.
 WebSocket declarations without the feature or without `transport.h1.upgrade`
 fail preparation rather than being ignored. This directive does not register
-H2 CONNECT or H3 WebTransport endpoints.
+H3 WebTransport endpoints.
 
 The service is registered only on workers and standalone processes; the master
 is not a JavaScript placement. Stop drains each mailbox, invokes the optional

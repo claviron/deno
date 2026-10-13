@@ -111,6 +111,8 @@ fn with_websockets(
     service: Arc<JsApplicationService>,
 ) -> Result<Router<AppState>> {
     use axum::middleware;
+    use axum::middleware::Next;
+    use axum::response::IntoResponse;
     use claviron::websocket::{
         H1UpgradeMiddlewareState, H1UpgradeRegistry, h1_upgrade_middleware,
     };
@@ -137,14 +139,42 @@ fn with_websockets(
             handler.clone(),
         )?;
     }
-    Ok(router.layer(middleware::from_fn_with_state(
-        H1UpgradeMiddlewareState {
-            app_state: context.state.clone(),
-            registry,
-            host: context.host.clone(),
-        },
-        h1_upgrade_middleware,
-    )))
+    let bindings = H1UpgradeMiddlewareState {
+        app_state: context.state.clone(),
+        registry,
+        host: context.host.clone(),
+    };
+    let h2_bindings = bindings.clone();
+    let h2_enabled = context.config.transport.h2.connect_protocol;
+    Ok(router
+        .layer(middleware::from_fn_with_state(bindings, h1_upgrade_middleware))
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let bindings = h2_bindings.clone();
+            let handler = handler.clone();
+            async move {
+                if request.version() != http::Version::HTTP_2
+                    || request.method() != http::Method::CONNECT
+                    || bindings
+                        .registry
+                        .resolve(&bindings.host, request.uri().path())
+                        .is_none()
+                {
+                    return next.run(request).await;
+                }
+                if !h2_enabled {
+                    return http::StatusCode::FORBIDDEN.into_response();
+                }
+                let (parts, body) = request.into_parts();
+                into_axum_response(
+                    handler
+                        .handle_connect(
+                            bindings.app_state,
+                            http::Request::from_parts(parts, boxed_body(body)),
+                        )
+                        .await,
+                )
+            }
+        })))
 }
 
 #[cfg(not(feature = "websocket"))]
