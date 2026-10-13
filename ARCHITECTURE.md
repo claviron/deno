@@ -188,11 +188,26 @@ engine. Hono works because its application path uses Web standards and ESM.
 
 ## Configuration and routing
 
-Each application may declare `framework` in `js.yaml`, or through
-`ApplicationDefinition::framework` in code. The execution owner prepares its
+Each application may declare `frameworks` in `js.yaml`, or through
+`ApplicationDefinition::frameworks` in code. Scalar `framework` and the singular
+builder remain single-label shorthands. Explicit lists, including `[]`, win.
+The execution owner prepares its
 common Application description as JavaScript / Claviron / fetch plus that
-optional framework. It is management metadata only, not module discovery,
+framework tags and optional symbolic `icon` (also `ApplicationDefinition::icon`).
+The GUI owns icon resolution and defaults; no path or URL is loaded. This is
+management metadata only, not module discovery,
 routing policy or a new runner. Local and Link reports use the same row.
+
+When no framework is declared, application registration reads the nearest
+`package.json` above the entry module. Its `dependencies` and `peerDependencies`
+identify Hono, Elysia, Express, Fastify, Koa, NestJS or Hapi; multiple distinct
+frameworks remain distinct tags. Development dependencies and framework helper
+packages do not count. An explicit YAML or code label always wins, without
+reading the package. Missing or unrecognized metadata remains unknown;
+unreadable or malformed metadata emits a warning without blocking registration.
+Detection stops at the nearest package even when that package yields no label.
+The description is stored once for local and linked observations, with no
+request-path filesystem access, module imports or changes to execution support.
 
 JavaScript follows the same configuration boundary as persistent PHP
 applications. `config/js.yaml` owns the runtime and its named applications:

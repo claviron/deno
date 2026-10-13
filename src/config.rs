@@ -191,8 +191,14 @@ impl Default for FetchConfig {
 #[serde(deny_unknown_fields)]
 pub struct ApplicationConfig {
     pub module: PathBuf,
+    #[serde(
+        default,
+        alias = "framework",
+        deserialize_with = "claviron::helpers::de::opt_one_or_many"
+    )]
+    pub frameworks: Option<Vec<String>>,
     #[serde(default)]
-    pub framework: Option<String>,
+    pub icon: Option<String>,
     #[serde(default = "default_instances")]
     pub instances: usize,
     #[serde(default)]
@@ -280,8 +286,14 @@ impl ApplicationConfig {
         ApplicationDefinition::new(name, module)
             .and_then(|definition| definition.instances(self.instances))
             .map(|definition| {
-                let definition = match &self.framework {
-                    Some(framework) => definition.framework(framework.as_str()),
+                let definition = match &self.frameworks {
+                    Some(frameworks) => {
+                        definition.frameworks(frameworks.iter().cloned())
+                    }
+                    None => definition,
+                };
+                let definition = match &self.icon {
+                    Some(icon) => definition.icon(icon.as_str()),
                     None => definition,
                 };
                 definition

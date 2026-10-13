@@ -189,9 +189,8 @@ impl JsApplicationService {
             definition.name().to_owned(),
             ManagedApplication {
                 description: claviron::app::ApplicationDescription {
-                    framework: definition
-                        .framework_name()
-                        .map(ToOwned::to_owned),
+                    frameworks: super::framework::resolve(&definition),
+                    icon: definition.icon_name().map(str::to_owned),
                     ..claviron::app::ApplicationDescription::new(
                         "javascript",
                         "fetch",

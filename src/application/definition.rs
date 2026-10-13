@@ -7,7 +7,8 @@ use crate::{Error, Result};
 /// Immutable inputs used to create one JavaScript application generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationDefinition {
-    framework: Option<Arc<str>>,
+    frameworks: Option<Vec<String>>,
+    icon: Option<String>,
     name: Arc<str>,
     main_module: PathBuf,
     instances: usize,
@@ -31,7 +32,8 @@ impl ApplicationDefinition {
         }
 
         Ok(Self {
-            framework: None,
+            frameworks: None,
+            icon: None,
             name,
             main_module,
             instances: 1,
@@ -44,16 +46,40 @@ impl ApplicationDefinition {
         &self.name
     }
 
+    /// Declare management metadata, overriding package.json detection.
+    /// This does not change module loading or request dispatch.
     pub fn framework(
         mut self,
-        framework: impl Into<Arc<str>>,
+        framework: impl Into<String>,
     ) -> Self {
-        self.framework = Some(framework.into());
+        self.frameworks = Some(vec![framework.into()]);
         self
     }
 
-    pub fn framework_name(&self) -> Option<&str> {
-        self.framework.as_deref()
+    pub fn frameworks(
+        mut self,
+        frameworks: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.frameworks =
+            Some(frameworks.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn framework_names(&self) -> Option<&[String]> {
+        self.frameworks.as_deref()
+    }
+
+    /// Symbolic admin-client icon code; does not load a file or change execution.
+    pub fn icon(
+        mut self,
+        icon: impl Into<String>,
+    ) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
+
+    pub fn icon_name(&self) -> Option<&str> {
+        self.icon.as_deref()
     }
 
     pub fn main_module(&self) -> &Path {
