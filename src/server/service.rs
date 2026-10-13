@@ -190,7 +190,9 @@ impl JsApplicationService {
             ManagedApplication {
                 description: claviron::app::ApplicationDescription {
                     frameworks: super::framework::resolve(&definition),
-                    icon: definition.icon_name().map(str::to_owned),
+                    icon: Some(
+                        definition.icon_name().unwrap_or("deno").to_owned(),
+                    ),
                     ..claviron::app::ApplicationDescription::new(
                         "javascript",
                         "fetch",

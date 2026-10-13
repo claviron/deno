@@ -194,6 +194,8 @@ builder remain single-label shorthands. Explicit lists, including `[]`, win.
 The execution owner prepares its
 common Application description as JavaScript / Claviron / fetch plus that
 framework tags and optional symbolic `icon` (also `ApplicationDefinition::icon`).
+An omitted icon resolves to `deno` for this embedded `deno_core` adapter;
+explicit codes are preserved and the runtime label remains JavaScript.
 The GUI owns icon resolution and defaults; no path or URL is loaded. This is
 management metadata only, not module discovery,
 routing policy or a new runner. Local and Link reports use the same row.
