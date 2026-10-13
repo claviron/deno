@@ -51,6 +51,7 @@ impl JsApplicationController {
         status: JsApplicationStatus,
     ) -> ApplicationSnapshot {
         ApplicationSnapshot {
+            description: status.description,
             id: ApplicationId::new(
                 self.runtime.clone(),
                 ApplicationName::new(status.name)

@@ -188,6 +188,12 @@ engine. Hono works because its application path uses Web standards and ESM.
 
 ## Configuration and routing
 
+Each application may declare `framework` in `js.yaml`, or through
+`ApplicationDefinition::framework` in code. The execution owner prepares its
+common Application description as JavaScript / Claviron / fetch plus that
+optional framework. It is management metadata only, not module discovery,
+routing policy or a new runner. Local and Link reports use the same row.
+
 JavaScript follows the same configuration boundary as persistent PHP
 applications. `config/js.yaml` owns the runtime and its named applications:
 `engine` contains process-wide engine policy, while `applications` maps stable

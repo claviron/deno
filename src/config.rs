@@ -191,6 +191,8 @@ impl Default for FetchConfig {
 #[serde(deny_unknown_fields)]
 pub struct ApplicationConfig {
     pub module: PathBuf,
+    #[serde(default)]
+    pub framework: Option<String>,
     #[serde(default = "default_instances")]
     pub instances: usize,
     #[serde(default)]
@@ -278,6 +280,10 @@ impl ApplicationConfig {
         ApplicationDefinition::new(name, module)
             .and_then(|definition| definition.instances(self.instances))
             .map(|definition| {
+                let definition = match &self.framework {
+                    Some(framework) => definition.framework(framework.as_str()),
+                    None => definition,
+                };
                 definition
                     .environments(self.env.clone())
                     .env_files(self.env_file.clone())

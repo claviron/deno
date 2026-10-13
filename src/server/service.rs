@@ -51,6 +51,7 @@ pub struct JsApplicationService {
 }
 
 struct ManagedApplication {
+    description: claviron::app::ApplicationDescription,
     definition: ApplicationDefinition,
     environment: BTreeMap<String, String>,
     dispatch: ApplicationDispatch,
@@ -67,6 +68,7 @@ struct ManagedApplication {
 
 pub(crate) struct JsApplicationStatus {
     pub(crate) name: String,
+    pub(crate) description: claviron::app::ApplicationDescription,
     pub(crate) enabled: bool,
     pub(crate) lifecycle: ApplicationLifecycle,
     pub(crate) generation: u64,
@@ -186,6 +188,16 @@ impl JsApplicationService {
         applications.insert(
             definition.name().to_owned(),
             ManagedApplication {
+                description: claviron::app::ApplicationDescription {
+                    framework: definition
+                        .framework_name()
+                        .map(ToOwned::to_owned),
+                    ..claviron::app::ApplicationDescription::new(
+                        "javascript",
+                        "fetch",
+                    )
+                    .runner("claviron")
+                },
                 environment: BTreeMap::new(),
                 definition,
                 dispatch,
@@ -564,6 +576,7 @@ fn application_status(
 ) -> JsApplicationStatus {
     JsApplicationStatus {
         name: name.to_owned(),
+        description: application.description.clone(),
         lifecycle: application.lifecycle,
         enabled: application.enabled,
         generation: application.generation,

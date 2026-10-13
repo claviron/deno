@@ -7,6 +7,7 @@ use crate::{Error, Result};
 /// Immutable inputs used to create one JavaScript application generation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationDefinition {
+    framework: Option<Arc<str>>,
     name: Arc<str>,
     main_module: PathBuf,
     instances: usize,
@@ -30,6 +31,7 @@ impl ApplicationDefinition {
         }
 
         Ok(Self {
+            framework: None,
             name,
             main_module,
             instances: 1,
@@ -40,6 +42,18 @@ impl ApplicationDefinition {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn framework(
+        mut self,
+        framework: impl Into<Arc<str>>,
+    ) -> Self {
+        self.framework = Some(framework.into());
+        self
+    }
+
+    pub fn framework_name(&self) -> Option<&str> {
+        self.framework.as_deref()
     }
 
     pub fn main_module(&self) -> &Path {
