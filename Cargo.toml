@@ -2,7 +2,7 @@
 autotests = false
 name = "claviron-deno"
 version = "0.2.0-alpha.16"
-publish = ["de02"]
+publish = true
 edition = "2024"
 description = "Claviron's slim persistent JavaScript application runtime"
 
@@ -60,7 +60,7 @@ websocket = [
 
 [dependencies]
 
-claviron = { path = "../claviron", version = "0.2.0-alpha.16", registry = "de02", default-features = false, optional = true }
+claviron = { path = "../claviron", version = "0.2.0-alpha.16", default-features = false, optional = true }
 
 # Stay within compatible Deno API lines, without imposing extra exact pins.
 # Upstream Deno crates may still pin their own dependencies (including rustls).

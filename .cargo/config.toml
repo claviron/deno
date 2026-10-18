@@ -1,5 +1,2 @@
-[registries.de02]
-index = "sparse+https://git.claviron.dev/api/packages/developer/cargo/"
-
 [env]
 SQLX_OFFLINE = { value = "true", force = false }
