@@ -3,8 +3,14 @@ autotests = false
 name = "claviron-deno"
 version = "0.2.0-alpha.16"
 publish = true
+license = "MIT OR Apache-2.0"
 edition = "2024"
-description = "Claviron's slim persistent JavaScript application runtime"
+description = "Embeddable JavaScript and TypeScript runtime for Claviron, powered by Deno Core and V8"
+repository = "https://github.com/claviron/deno"
+homepage = "https://github.com/claviron"
+documentation = "https://docs.rs/claviron-deno"
+keywords = ["javascript", "typescript", "deno", "v8", "claviron"]
+categories = ["web-programming::http-server", "asynchronous", "development-tools"]
 
 [features]
 default = []
