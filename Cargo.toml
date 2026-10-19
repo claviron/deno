@@ -11,6 +11,7 @@ homepage = "https://github.com/claviron"
 documentation = "https://docs.rs/claviron-deno"
 keywords = ["javascript", "typescript", "deno", "v8", "claviron"]
 categories = ["web-programming::http-server", "asynchronous", "development-tools"]
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE-*"]
 
 [features]
 default = []
