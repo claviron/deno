@@ -1,7 +1,7 @@
 [package]
 autotests = false
 name = "claviron-deno"
-version = "0.2.0-alpha.18"
+version = "0.2.0-alpha.23"
 publish = true
 license = "MIT OR Apache-2.0"
 edition = "2024"
@@ -67,7 +67,7 @@ websocket = [
 
 [dependencies]
 
-claviron = { path = "../claviron", default-features = false, optional = true }
+claviron = { version = "0.2.0-alpha.23", path = "../claviron", default-features = false, optional = true }
 
 # Stay within compatible Deno API lines, without imposing extra exact pins.
 # Upstream Deno crates may still pin their own dependencies (including rustls).

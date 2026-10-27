@@ -39,8 +39,8 @@ packages, execute CommonJS or provide Node built-ins.
 
 ```toml
 [dependencies]
-claviron = { version = "0.2.0-alpha.18", default-features = false, features = ["edge"] }
-claviron-deno = { version = "0.2.0-alpha.18", features = ["edge"] }
+claviron = { version = "0.2.0-alpha.23", default-features = false, features = ["edge"] }
+claviron-deno = { version = "0.2.0-alpha.23", features = ["edge"] }
 ```
 
 In the host's registration callback:
