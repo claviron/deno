@@ -370,6 +370,12 @@ Allocation failure throws rather than producing an unshared fallback value.
 The existing explicit `release()` contract is unchanged, so passing an id
 between language runtimes does not introduce a new ownership protocol.
 
+Scalar `version()` and `changed()` tokens remain JavaScript Numbers bounded
+by `u32`; string-cell tokens are BigInts carrying the complete `u64` revision.
+The private op boundary transports revisions as decimal strings, preserving
+all bits without JavaScript Number coercion. Invalid or out-of-range wait
+tokens are rejected rather than wrapped.
+
 ## Runtime boundary
 
 This is an embedded `deno_core` engine, not a full `deno_runtime::MainWorker`
@@ -401,6 +407,6 @@ remain unchanged; the Rust package rename is not a wire/config rename.
 
 Direct dependencies use compatible semver ranges, not additional exact pins.
 Deno's own crates may still require exact versions internally. In particular,
-the selected deno_tls 0.246 line pins rustls 0.23.40. Widening this package's
+the selected deno_tls 0.247 line pins rustls 0.23.40. Widening this package's
 deno_tls requirement does not override that upstream constraint. `fetch` owns
 that outbound stack; Claviron retains ownership of its inbound TLS stack.

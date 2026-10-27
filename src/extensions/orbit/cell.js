@@ -49,6 +49,24 @@ function encode(kind, value) {
     }
 }
 
+function decodeRevision(kind, value) {
+    return kind === "string" ? BigInt(value) : Number(value);
+}
+
+function encodeRevision(kind, value) {
+    if (kind === "string") {
+        if (typeof value !== "bigint") {
+            throw new TypeError("a string cell revision must be a bigint");
+        }
+        if (value < 0n || value > 0xffffffffffffffffn) {
+            throw new RangeError("a string cell revision must fit an unsigned 64-bit integer");
+        }
+    } else if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+        throw new RangeError("a scalar revision must fit an unsigned 32-bit integer");
+    }
+    return value.toString();
+}
+
 // A typed fleet cell as a JavaScript value.
 //
 // The handle holds only the id; the value lives in Orbit shared memory and
@@ -165,10 +183,10 @@ class Orbital {
         return core.ops.op_claviron_orbit_cell_append({ id: this.#id, text: String(text) });
     }
 
-    // The write count: what `changed()` waits against. Take it before
-    // `get()` and no write between the two is missed.
+    // Scalar write counts are Numbers; string revisions are full-width BigInts.
+    // Take the token before `get()` and no write between the two is missed.
     version() {
-        return core.ops.op_claviron_orbit_cell_version(this.#id);
+        return decodeRevision(this.#kind, core.ops.op_claviron_orbit_cell_version(this.#id));
     }
 
     // Resolves with the new write count once the cell has been written since
@@ -176,7 +194,10 @@ class Orbital {
     // writes while waiting resolve it once, and `get()` reads the latest.
     // Rejects when the cell has been released.
     changed(since) {
-        return core.ops.op_claviron_orbit_cell_wait_changed({ id: this.#id, since: since >>> 0 });
+        return core.ops.op_claviron_orbit_cell_wait_changed({
+            id: this.#id,
+            since: encodeRevision(this.#kind, since),
+        }).then(value => decodeRevision(this.#kind, value));
     }
 
     // Retires the cell for every handle, in every process.

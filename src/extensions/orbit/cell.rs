@@ -251,11 +251,11 @@ impl Cell {
         cell.load().map_err(failure)
     }
 
-    fn version(&self) -> Result<u32, JsErrorBox> {
+    fn version(&self) -> Result<u64, JsErrorBox> {
         match self {
-            Self::Int(cell) => cell.version(),
-            Self::Float(cell) => cell.version(),
-            Self::Bool(cell) => cell.version(),
+            Self::Int(cell) => cell.version().map(u64::from),
+            Self::Float(cell) => cell.version().map(u64::from),
+            Self::Bool(cell) => cell.version().map(u64::from),
             Self::Text(cell) => cell.version(),
         }
         .map_err(failure)
@@ -266,13 +266,24 @@ impl Cell {
     /// interrupt, never a clock.
     fn wait_changed_until(
         &self,
-        since: u32,
+        since: u64,
         interrupt: &AtomicBool,
-    ) -> Result<Option<u32>, JsErrorBox> {
+    ) -> Result<Option<u64>, JsErrorBox> {
+        let scalar = || {
+            u32::try_from(since).map_err(|_| {
+                failure("a scalar revision must fit an unsigned 32-bit integer")
+            })
+        };
         match self {
-            Self::Int(cell) => cell.wait_changed_until(since, interrupt),
-            Self::Float(cell) => cell.wait_changed_until(since, interrupt),
-            Self::Bool(cell) => cell.wait_changed_until(since, interrupt),
+            Self::Int(cell) => cell
+                .wait_changed_until(scalar()?, interrupt)
+                .map(|value| value.map(u64::from)),
+            Self::Float(cell) => cell
+                .wait_changed_until(scalar()?, interrupt)
+                .map(|value| value.map(u64::from)),
+            Self::Bool(cell) => cell
+                .wait_changed_until(scalar()?, interrupt)
+                .map(|value| value.map(u64::from)),
             Self::Text(cell) => cell.wait_changed_until(since, interrupt),
         }
         .map_err(failure)
@@ -372,16 +383,17 @@ pub(super) fn op_claviron_orbit_cell_append(
 #[derive(Debug, Deserialize)]
 pub(super) struct WaitRequest {
     id: String,
-    since: u32,
+    since: String,
 }
 
-#[op2(fast)]
+#[op2]
+#[string]
 pub(super) fn op_claviron_orbit_cell_version(
     state: &OpState,
     #[string] id: String,
-) -> Result<u32, JsErrorBox> {
+) -> Result<String, JsErrorBox> {
     let cells = cells(state)?;
-    Cell::open(&cells, &id)?.version()
+    Cell::open(&cells, &id)?.version().map(|value| value.to_string())
 }
 
 /// Wake whoever is parked on this cell without writing to it. On its own
@@ -408,17 +420,21 @@ pub(super) fn wake_waiters(
 /// kernel releases it, and shutdown releases it by setting the word the
 /// waiter also watches and then waking the cell.
 #[op2]
+#[string]
 pub(super) async fn op_claviron_orbit_cell_wait_changed(
     state: Rc<RefCell<OpState>>,
     #[serde] request: WaitRequest,
-) -> Result<u32, JsErrorBox> {
+) -> Result<String, JsErrorBox> {
+    let since = parse::<u64>(
+        &request.since,
+        "a revision must fit an unsigned 64-bit integer",
+    )?;
     let (cells, waits) = {
         let state = state.borrow();
         (cells(&state)?.clone(), state.borrow::<OrbitContext>().cell_waits())
     };
 
     let parked = waits.register(cells.clone(), request.id.clone());
-    let since = request.since;
     let id = request.id.clone();
     let waiting = Arc::clone(&waits);
     let outcome = tokio::task::spawn_blocking(move || {
@@ -431,7 +447,7 @@ pub(super) async fn op_claviron_orbit_cell_wait_changed(
     match outcome
         .map_err(|error| failure(format!("wait interrupted: {error}")))??
     {
-        Some(changes) => Ok(changes),
+        Some(changes) => Ok(changes.to_string()),
         None => {
             Err(failure("cell wait ended: this JavaScript runtime is stopping"))
         }
