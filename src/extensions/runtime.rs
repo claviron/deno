@@ -7,8 +7,7 @@ use deno_core::{Extension, OpState, op2};
 
 use crate::ExtensionContext;
 use crate::application::{
-    PendingReply, PendingRequest, PendingRequestStream, RESPONSE_BODY_CAPACITY,
-    ResponseBodySender, ResponseHead,
+    RESPONSE_BODY_CAPACITY, RequestResource, RequestResources, ResponseHead,
 };
 
 #[op2]
@@ -50,33 +49,68 @@ async fn op_claviron_runtime_yield(#[string] value: String) -> String {
     value
 }
 
+fn request_resource(
+    state: &OpState,
+    id: u64,
+) -> Result<Rc<RequestResource>, deno_error::JsErrorBox> {
+    let request =
+        state.borrow::<RequestResources>().get(id).ok_or_else(|| {
+            deno_error::JsErrorBox::type_error("request is closed")
+        })?;
+    if request.closed.get() {
+        return Err(deno_error::JsErrorBox::type_error("request is closed"));
+    }
+    Ok(request)
+}
+
 #[op2]
 #[string]
-fn op_claviron_application_request(state: &mut OpState) -> String {
-    std::mem::take(&mut state.borrow_mut::<PendingRequest>().head)
+fn op_claviron_application_request(
+    state: &OpState,
+    #[number] id: u64,
+) -> Result<String, deno_error::JsErrorBox> {
+    let resource = request_resource(state, id)?;
+    let mut pending = resource.request.borrow_mut();
+    let request = pending.as_mut().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error("request was already consumed")
+    })?;
+    Ok(std::mem::take(&mut request.head))
 }
 
-/// The waiting request's body, as a `Uint8Array`. Taken once, after its head.
 #[op2]
 #[buffer]
-fn op_claviron_application_request_body(state: &mut OpState) -> Vec<u8> {
-    state.take::<PendingRequest>().body
+fn op_claviron_application_request_body(
+    state: &OpState,
+    #[number] id: u64,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let resource = request_resource(state, id)?;
+    let request = resource.request.borrow_mut().take().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error("request body was already consumed")
+    })?;
+    Ok(request.body)
 }
 
-/// The next piece of a streamed request body; empty at its end. A body read
-/// that failed — too large, stalled, its client gone — fails this read, so the
-/// handler's stream errors instead of ending as if whole.
+/// Only a live request body enters this path; its receiver has one owner.
 #[op2]
 #[buffer]
 async fn op_claviron_application_request_read(
-    state: Rc<RefCell<OpState>>
+    state: Rc<RefCell<OpState>>,
+    #[number] id: u64,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let receiver = state
-        .borrow()
-        .try_borrow::<PendingRequestStream>()
-        .map(|body| body.0.clone());
-    let Some(receiver) = receiver else { return Ok(Vec::new()) };
-    let next = receiver.lock().await.recv().await;
+    let resource = request_resource(&state.borrow(), id)?;
+    let mut receiver = resource.input.borrow_mut().take().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error(
+            "request body is closed or already being read",
+        )
+    })?;
+    let next = tokio::select! {
+        biased;
+        _ = resource.lifetime.cancellation.cancelled() => return Err(deno_error::JsErrorBox::generic("request cancelled")),
+        next = receiver.recv() => next,
+    };
+    if !resource.closed.get() {
+        *resource.input.borrow_mut() = Some(receiver);
+    }
     match next {
         Some(Ok(chunk)) => Ok(chunk.to_vec()),
         Some(Err(error)) => Err(deno_error::JsErrorBox::generic(error)),
@@ -84,46 +118,76 @@ async fn op_claviron_application_request_read(
     }
 }
 
-/// The handler answered: its head goes to the caller now, and the body
-/// follows through `op_claviron_application_response_write`.
+/// Static replies cross the bridge once, without a stream channel or pump.
 #[op2(fast)]
-fn op_claviron_application_response_head(
-    state: &mut OpState,
+fn op_claviron_application_response_whole(
+    state: &OpState,
+    #[number] id: u64,
     #[string] head: String,
-) -> Result<(), deno_error::JsErrorBox> {
+    #[buffer(copy)] body: Vec<u8>,
+) -> Result<bool, deno_error::JsErrorBox> {
+    let resource = request_resource(state, id)?;
     let head: ResponseHead = serde_json::from_str(&head).map_err(|error| {
         deno_error::JsErrorBox::type_error(error.to_string())
     })?;
-    let Some(PendingReply(reply)) = state.try_take::<PendingReply>() else {
-        return Err(deno_error::JsErrorBox::type_error(
-            "the response head was already sent",
-        ));
-    };
-    let (sender, receiver) = tokio::sync::mpsc::channel(RESPONSE_BODY_CAPACITY);
-    state.put(ResponseBodySender(sender));
-    let _ = reply.send(Ok(crate::ApplicationResponse {
-        status: head.status,
-        headers: head.headers,
-        body: receiver,
-    }));
-    Ok(())
+    let reply = resource.reply.borrow_mut().take().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error("response head was already sent")
+    })?;
+    Ok(reply
+        .send(Ok(crate::ApplicationResponse {
+            status: head.status,
+            headers: head.headers,
+            body: crate::ResponseBody::Whole(bytes::Bytes::from(body)),
+        }))
+        .is_ok())
 }
 
-/// One piece of the reply's body. Waits while the client is not reading;
-/// `false` means the client is gone and the handler should stop.
+/// The first live response commits its head and creates only its own channel.
+#[op2(fast)]
+fn op_claviron_application_response_head(
+    state: &OpState,
+    #[number] id: u64,
+    #[string] head: String,
+) -> Result<bool, deno_error::JsErrorBox> {
+    let resource = request_resource(state, id)?;
+    let head: ResponseHead = serde_json::from_str(&head).map_err(|error| {
+        deno_error::JsErrorBox::type_error(error.to_string())
+    })?;
+    let reply = resource.reply.borrow_mut().take().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error("response head was already sent")
+    })?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(RESPONSE_BODY_CAPACITY);
+    let (completion, finished) = tokio::sync::oneshot::channel();
+    *resource.output.borrow_mut() = Some(sender);
+    *resource.completion.borrow_mut() = Some(completion);
+    Ok(reply
+        .send(Ok(crate::ApplicationResponse {
+            status: head.status,
+            headers: head.headers,
+            body: crate::ResponseBody::Stream(crate::ResponseStream::new(
+                receiver,
+                finished,
+                resource.lifetime.cancellation.clone(),
+            )),
+        }))
+        .is_ok())
+}
+
 #[op2]
 async fn op_claviron_application_response_write(
     state: Rc<RefCell<OpState>>,
+    #[number] id: u64,
     #[buffer(copy)] chunk: Vec<u8>,
-) -> bool {
-    let sender = state
-        .borrow()
-        .try_borrow::<ResponseBodySender>()
-        .map(|body| body.0.clone());
-    match sender {
-        Some(sender) => sender.send(bytes::Bytes::from(chunk)).await.is_ok(),
-        None => false,
-    }
+) -> Result<bool, deno_error::JsErrorBox> {
+    let resource = request_resource(&state.borrow(), id)?;
+    let sender = resource.output.borrow().clone().ok_or_else(|| {
+        deno_error::JsErrorBox::type_error("response is not a live stream")
+    })?;
+    Ok(tokio::select! {
+        biased;
+        _ = resource.lifetime.cancellation.cancelled() => false,
+        result = sender.send(bytes::Bytes::from(chunk)) => result.is_ok(),
+    })
 }
 
 #[op2(fast)]
@@ -180,6 +244,7 @@ deno_core::extension!(
         op_claviron_application_request,
         op_claviron_application_request_body,
         op_claviron_application_request_read,
+        op_claviron_application_response_whole,
         op_claviron_application_response_head,
         op_claviron_application_response_write,
         op_claviron_console_write,
@@ -191,6 +256,7 @@ deno_core::extension!(
     },
     state = |state, options| {
         state.put(options.context);
+        state.put(RequestResources::default());
     },
 );
 

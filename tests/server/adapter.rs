@@ -71,3 +71,42 @@ fn application_execution_errors_remain_internal_server_errors() {
 
     assert_eq!(status_for_error(&error), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// GET and HEAD must not enter request-body inspection, even for metadata.
+#[tokio::test]
+async fn bodyless_fetch_methods_never_inspect_the_request_body() {
+    struct Uninspected;
+    impl http_body::Body for Uninspected {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Option<Result<http_body::Frame<Self::Data>, Self::Error>>,
+        > {
+            panic!("bodyless request must not be read")
+        }
+        fn is_end_stream(&self) -> bool {
+            panic!("bodyless request must not be inspected")
+        }
+        fn size_hint(&self) -> http_body::SizeHint {
+            panic!("bodyless request must not be sized")
+        }
+    }
+    let adapter = JsApplicationAdapter::new(
+        Arc::new(JsApplicationService::new()),
+        "stopped",
+    );
+    for method in [http::Method::GET, http::Method::HEAD] {
+        let request = Request::builder()
+            .method(method)
+            .uri("http://example.test/")
+            .body(claviron::http::boxed_body(Uninspected))
+            .unwrap();
+        assert_eq!(
+            adapter.handle(request).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}

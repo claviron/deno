@@ -106,3 +106,8 @@ tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "http-concurrency"
+path = "examples/http-concurrency/main.rs"
+required-features = ["server", "fetch"]

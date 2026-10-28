@@ -8,7 +8,8 @@ use deno_core::{JsRuntime, ModuleSpecifier, RuntimeOptions};
 use super::platform::runtime_extensions;
 use super::typescript::transpile_extension;
 use super::{ClavironModuleLoader, TypeScriptModuleLoader};
-use crate::application::PendingRequest;
+#[path = "requests.rs"]
+mod requests;
 #[cfg(feature = "websocket")]
 use crate::application::{
     PendingWebSocketEvent, WebSocketActionSender, WebSocketEvent,
@@ -20,12 +21,11 @@ use crate::extensions::orbit::{
 };
 #[cfg(feature = "websocket")]
 use crate::extensions::websocket::WebSocketSinks;
-use crate::{ApplicationRequest, Error, ExtensionContext, Result};
+use crate::{Error, ExtensionContext, Result};
 
 #[cfg(not(feature = "fetch"))]
 const WEB_BOOTSTRAP: &str = include_str!("web.js");
-const DISPATCH_SCRIPT: &str =
-    "globalThis[Symbol.for('claviron.application.dispatch')]()";
+
 #[cfg(feature = "server")]
 const SHUTDOWN_SCRIPT: &str =
     "globalThis[Symbol.for('claviron.application.shutdown')]()";
@@ -42,6 +42,9 @@ const WEBSOCKET_BOOTSTRAP: &str = "";
 
 pub(crate) struct CoreEngine {
     runtime: JsRuntime,
+    dispatch: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    cancel: Option<deno_core::v8::Global<deno_core::v8::Function>>,
+    pending: requests::PendingRequests,
     #[cfg(feature = "websocket")]
     websocket: bool,
 }
@@ -81,19 +84,12 @@ impl CoreEngine {
 
         Ok(Self {
             runtime,
+            dispatch: None,
+            cancel: None,
+            pending: Default::default(),
             #[cfg(feature = "websocket")]
             websocket: false,
         })
-    }
-
-    #[cfg(feature = "server")]
-    pub(crate) fn isolate_handle(&mut self) -> deno_core::v8::IsolateHandle {
-        self.runtime.v8_isolate().thread_safe_handle()
-    }
-
-    #[cfg(feature = "server")]
-    pub(crate) fn cancel_terminate_execution(&mut self) {
-        self.runtime.v8_isolate().cancel_terminate_execution();
     }
 
     pub(crate) async fn boot(
@@ -113,67 +109,8 @@ impl CoreEngine {
         let main_module_json = serde_json::to_string(main_module.as_str())?;
         let websocket_bootstrap = WEBSOCKET_BOOTSTRAP;
         let bootstrap = format!(
-            r#"
-                import application from {main_module_json};
-
-                const fetch = typeof application === "function"
-                    ? application
-                    : application?.fetch;
-                if (typeof fetch !== "function") {{
-                    throw new TypeError("JavaScript application must default-export a fetch function or an object with fetch(request)");
-                }}
-
-                const runtime = globalThis[Symbol.for("claviron.runtime")];
-                globalThis[Symbol.for("claviron.application.dispatch")] = async () => {{
-                    const raw = JSON.parse(runtime.takeApplicationRequest());
-                    let requestBody;
-                    if (raw.streamed) {{
-                        // Pieces as they arrive; an empty one is the end.
-                        requestBody = new ReadableStream({{
-                            async pull(controller) {{
-                                const chunk = await runtime.readRequestBody();
-                                if (chunk.length === 0) controller.close();
-                                else controller.enqueue(chunk);
-                            }},
-                        }});
-                    }} else {{
-                        const whole = runtime.takeApplicationRequestBody();
-                        requestBody = whole.length === 0 ? undefined : whole;
-                    }}
-                    const request = new Request(raw.url, {{
-                        method: raw.method,
-                        headers: raw.headers,
-                        body: requestBody,
-                        duplex: "half",
-                    }});
-                    const response = await fetch.call(application, request);
-                    if (!(response instanceof Response)) {{
-                        throw new TypeError("JavaScript application fetch handler must return a Response");
-                    }}
-                    runtime.respondHead(JSON.stringify({{
-                        status: response.status,
-                        headers: Array.from(response.headers),
-                    }}));
-                    if (response.body !== null) {{
-                        const reader = response.body.getReader();
-                        while (true) {{
-                            const {{ done, value }} = await reader.read();
-                            if (done) break;
-                            if (value.length !== 0 && !(await runtime.writeBody(value))) {{
-                                // The client is gone: stop the source too.
-                                await reader.cancel();
-                                break;
-                            }}
-                        }}
-                    }}
-                }};
-
-                globalThis[Symbol.for("claviron.application.shutdown")] = async () => {{
-                    await application?.shutdown?.call(application);
-                }};
-
-                {websocket_bootstrap}
-            "#
+            "import application from {main_module_json};\n({})(application);\n{websocket_bootstrap}",
+            include_str!("application.js"),
         );
         let module_id = self
             .runtime
@@ -195,6 +132,12 @@ impl CoreEngine {
                 deno_core::v8::Local::new(scope, value).boolean_value(scope);
         }
 
+        self.dispatch = Some(self.function(
+            "globalThis[Symbol.for('claviron.application.dispatch')]",
+        )?);
+        self.cancel = Some(self.function(
+            "globalThis[Symbol.for('claviron.application.cancel')]",
+        )?);
         Ok(())
     }
 
@@ -224,78 +167,6 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Run one request. Its head goes to `reply` as soon as the handler
-    /// returns a `Response` (from inside the isolate, through an op), and the
-    /// body follows while this keeps driving the event loop; returns when the
-    /// handler has finished writing. A handler that fails before answering
-    /// sends its error to `reply` instead.
-    pub(crate) async fn handle(
-        &mut self,
-        request: ApplicationRequest,
-        reply: crate::application::ReplySender,
-    ) -> Result<()> {
-        let outcome = self.dispatch(request, reply).await;
-        let op_state = self.runtime.op_state();
-        let mut state = op_state.borrow_mut();
-        // The body ends when its sender goes; an unread request body is let
-        // go with the request.
-        let _ = state.try_take::<crate::application::ResponseBodySender>();
-        let _ = state.try_take::<crate::application::PendingRequestStream>();
-        let _ = state.try_take::<PendingRequest>();
-        if let Some(crate::application::PendingReply(reply)) =
-            state.try_take::<crate::application::PendingReply>()
-        {
-            let error = match &outcome {
-                Err(error) => error.to_string(),
-                Ok(()) => {
-                    "JavaScript application handler ended without a response"
-                        .to_owned()
-                }
-            };
-            let _ = reply.send(Err(error));
-        }
-        outcome
-    }
-
-    async fn dispatch(
-        &mut self,
-        request: ApplicationRequest,
-        reply: crate::application::ReplySender,
-    ) -> Result<()> {
-        let (body, stream) = match request.body {
-            crate::RequestBody::Whole(body) => (body, None),
-            crate::RequestBody::Stream(receiver) => {
-                (Vec::new(), Some(receiver))
-            }
-        };
-        let head = serde_json::to_string(&crate::application::RequestHead {
-            method: &request.method,
-            url: &request.url,
-            headers: &request.headers,
-            streamed: stream.is_some(),
-        })?;
-        {
-            let op_state = self.runtime.op_state();
-            let mut state = op_state.borrow_mut();
-            state.put(PendingRequest { head, body });
-            if let Some(receiver) = stream {
-                state.put(crate::application::PendingRequestStream(
-                    std::rc::Rc::new(tokio::sync::Mutex::new(receiver)),
-                ));
-            }
-            state.put(crate::application::PendingReply(reply));
-        }
-        let promise = self
-            .runtime
-            .execute_script("claviron:application/dispatch", DISPATCH_SCRIPT)?;
-        #[allow(
-            deprecated,
-            reason = "deno_core compatibility API drives the event loop"
-        )]
-        self.runtime.resolve_value(promise).await?;
-        Ok(())
-    }
-
     /// Stop this isolate: take no new work, then let what is running end.
     ///
     /// The two are not the same, and treating them as one is what wedged a
@@ -318,46 +189,51 @@ impl CoreEngine {
             &self.runtime.op_state().borrow(),
         );
 
-        let promise = self
-            .runtime
-            .execute_script("claviron:application/shutdown", SHUTDOWN_SCRIPT)?;
-        #[allow(
-            deprecated,
-            reason = "deno_core compatibility API drives the event loop"
-        )]
-        self.runtime.resolve_value(promise).await?;
-        self.runtime.run_event_loop(Default::default()).await?;
-        Ok(())
-    }
+        self.runtime.execute_script(
+            "claviron:application/drain",
+            "globalThis[Symbol.for('claviron.application.drain')]()",
+        )?;
+        // Accepted calls finish before application resources are torn down.
+        // Background timers are left for shutdown() to clean up afterwards.
+        self.drain_requests().await?;
 
-    /// Drive detached promises and timers while the application worker is idle.
-    #[cfg(feature = "server")]
-    pub(crate) async fn drive_event_loop(&mut self) -> Result<()> {
-        self.runtime.run_event_loop(Default::default()).await?;
-        Ok(())
+        let (reply, finished) = tokio::sync::oneshot::channel();
+        self.schedule_command(
+            SHUTDOWN_SCRIPT,
+            reply,
+            #[cfg(feature = "websocket")]
+            None,
+        );
+        self.drive_event_loop().await?;
+        finished
+            .await
+            .map_err(|_| Error::RequestChannelClosed)?
+            .map_err(Error::ApplicationUnavailable)
     }
 
     #[cfg(feature = "orbit")]
-    pub(crate) async fn application_event(
+    pub(crate) fn application_event(
         &mut self,
         event: ApplicationEvent,
-    ) -> Result<()> {
-        let event = application_event_json(&event)
-            .map_err(Error::ApplicationUnavailable)?;
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        let event = match application_event_json(&event) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = reply.send(Err(error.to_string()));
+                return;
+            }
+        };
         self.runtime
             .op_state()
             .borrow_mut()
             .put(PendingApplicationEvent(event));
-        let promise = self.runtime.execute_script(
-            "claviron:application/fleet-event-dispatch",
+        self.schedule_command(
             APPLICATION_EVENT_DISPATCH_SCRIPT,
-        )?;
-        #[allow(
-            deprecated,
-            reason = "deno_core compatibility API drives the event loop"
-        )]
-        self.runtime.resolve_value(promise).await?;
-        Ok(())
+            reply,
+            #[cfg(feature = "websocket")]
+            None,
+        );
     }
 
     #[cfg(feature = "websocket")]
@@ -366,11 +242,12 @@ impl CoreEngine {
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_open(
+    pub(crate) fn websocket_open(
         &mut self,
         event: WebSocketEvent,
         sender: WebSocketActionSender,
-    ) -> Result<()> {
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
         let id = match &event {
             WebSocketEvent::Open { id, .. } => *id,
             _ => unreachable!("websocket_open requires an open event"),
@@ -380,52 +257,47 @@ impl CoreEngine {
             .borrow_mut()
             .borrow_mut::<WebSocketSinks>()
             .insert(id, sender);
-        if let Err(error) = self.dispatch_websocket(event).await {
-            self.remove_websocket_sink(id);
-            return Err(error);
-        }
-        Ok(())
+        self.dispatch_websocket(event, reply, Some((id, false)));
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_event(
+    pub(crate) fn websocket_event(
         &mut self,
         event: WebSocketEvent,
-    ) -> Result<()> {
-        self.dispatch_websocket(event).await
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        self.dispatch_websocket(event, reply, None);
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_close(
+    pub(crate) fn websocket_close(
         &mut self,
         event: WebSocketEvent,
-    ) -> Result<()> {
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
         let WebSocketEvent::Close { id, .. } = &event else {
             unreachable!("websocket_close requires a close event")
         };
         let id = *id;
-        let result = self.dispatch_websocket(event).await;
-        self.remove_websocket_sink(id);
-        result
+        self.dispatch_websocket(event, reply, Some((id, true)));
     }
 
     #[cfg(feature = "websocket")]
-    async fn dispatch_websocket(
+    fn dispatch_websocket(
         &mut self,
         event: WebSocketEvent,
-    ) -> Result<()> {
-        let event = serde_json::to_string(&event)?;
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        socket: Option<(u32, bool)>,
+    ) {
+        let event = match serde_json::to_string(&event) {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = reply.send(Err(error.to_string()));
+                return;
+            }
+        };
         self.runtime.op_state().borrow_mut().put(PendingWebSocketEvent(event));
-        let promise = self.runtime.execute_script(
-            "claviron:application/websocket-dispatch",
-            WEBSOCKET_DISPATCH_SCRIPT,
-        )?;
-        #[allow(
-            deprecated,
-            reason = "deno_core compatibility API drives the event loop"
-        )]
-        self.runtime.resolve_value(promise).await?;
-        Ok(())
+        self.schedule_command(WEBSOCKET_DISPATCH_SCRIPT, reply, socket);
     }
 
     #[cfg(feature = "websocket")]

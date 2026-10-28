@@ -150,7 +150,7 @@ async fn carries_request_and_reply_bodies_as_bytes() {
             let mut response = replied.await.unwrap().unwrap();
             let mut received = Vec::new();
             while let Some(chunk) = response.body.recv().await {
-                received.extend_from_slice(&chunk);
+                received.extend_from_slice(&chunk.unwrap());
             }
             (response.status, response.headers, received)
         }
@@ -224,7 +224,7 @@ async fn streams_a_request_body_and_fails_a_cut_one() {
                 let mut response = replied.await.unwrap().unwrap();
                 let mut received = Vec::new();
                 while let Some(chunk) = response.body.recv().await {
-                    received.extend_from_slice(&chunk);
+                    received.extend_from_slice(&chunk.unwrap());
                 }
                 (response.status, received)
             }

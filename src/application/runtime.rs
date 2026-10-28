@@ -83,14 +83,24 @@ impl CoreApplication {
         self.engine.handle(request, reply).await
     }
 
-    #[cfg(feature = "server")]
-    pub(crate) fn isolate_handle(&mut self) -> deno_core::v8::IsolateHandle {
-        self.engine.isolate_handle()
+    /// Start a request without waiting for its handler or live response body.
+    /// The host must keep driving [`Self::drive_event_loop`] alongside its inbox.
+    pub fn dispatch(
+        &mut self,
+        request: ApplicationRequest,
+        reply: crate::application::ReplySender,
+    ) -> Result<()> {
+        self.engine.start_request(request, reply, Default::default())
     }
 
     #[cfg(feature = "server")]
-    pub(crate) fn cancel_terminate_execution(&mut self) {
-        self.engine.cancel_terminate_execution();
+    pub(crate) fn start_request(
+        &mut self,
+        request: ApplicationRequest,
+        reply: crate::application::ReplySender,
+        lifetime: super::RequestLifetime,
+    ) -> Result<()> {
+        self.engine.start_request(request, reply, lifetime)
     }
 
     #[cfg(feature = "server")]
@@ -98,17 +108,19 @@ impl CoreApplication {
         self.engine.shutdown().await
     }
 
-    #[cfg(feature = "server")]
-    pub(crate) async fn drive_event_loop(&mut self) -> Result<()> {
+    /// Advance all accepted calls and background JavaScript on the owner thread.
+    /// Pending I/O uses runtime wakeups; no polling interval is introduced.
+    pub async fn drive_event_loop(&mut self) -> Result<()> {
         self.engine.drive_event_loop().await
     }
 
     #[cfg(feature = "orbit")]
-    pub(crate) async fn application_event(
+    pub(crate) fn application_event(
         &mut self,
         event: ApplicationEvent,
-    ) -> Result<()> {
-        self.engine.application_event(event).await
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        self.engine.application_event(event, reply)
     }
 
     #[cfg(feature = "websocket")]
@@ -117,27 +129,30 @@ impl CoreApplication {
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_open(
+    pub(crate) fn websocket_open(
         &mut self,
         event: WebSocketEvent,
         sender: WebSocketActionSender,
-    ) -> Result<()> {
-        self.engine.websocket_open(event, sender).await
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        self.engine.websocket_open(event, sender, reply)
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_event(
+    pub(crate) fn websocket_event(
         &mut self,
         event: WebSocketEvent,
-    ) -> Result<()> {
-        self.engine.websocket_event(event).await
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        self.engine.websocket_event(event, reply)
     }
 
     #[cfg(feature = "websocket")]
-    pub(crate) async fn websocket_close(
+    pub(crate) fn websocket_close(
         &mut self,
         event: WebSocketEvent,
-    ) -> Result<()> {
-        self.engine.websocket_close(event).await
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    ) {
+        self.engine.websocket_close(event, reply)
     }
 }

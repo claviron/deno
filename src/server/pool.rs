@@ -1,15 +1,15 @@
 #[cfg(feature = "websocket")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::application::{RequestCounters, RequestLifetime};
 #[cfg(feature = "orbit")]
 use claviron::app::ApplicationEvent;
 use claviron::app::{ApplicationLimits, ApplicationRetryPolicy};
-use deno_core::v8;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -33,8 +33,7 @@ enum WorkerCommand {
         started: oneshot::Sender<()>,
         reply:
             oneshot::Sender<std::result::Result<ApplicationResponse, String>>,
-        control: Arc<RequestControl>,
-        _slot: OwnedSemaphorePermit,
+        lifetime: RequestLifetime,
     },
     #[cfg(feature = "orbit")]
     ApplicationEvent {
@@ -62,13 +61,11 @@ enum WorkerCommand {
 
 struct ApplicationWorker {
     sender: mpsc::Sender<WorkerCommand>,
-    request_slot: Arc<Semaphore>,
-    isolate: v8::IsolateHandle,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Requests this generation of the instance completed. A worker that
     /// served anything proved itself, so its failure counter starts over —
     /// only a boot or crash loop without progress keeps backing off.
-    served: Arc<AtomicU64>,
+    counters: Arc<RequestCounters>,
     #[cfg(feature = "websocket")]
     supports_websocket: bool,
 }
@@ -107,16 +104,13 @@ struct WorkerExit {
     error: Option<String>,
 }
 
-struct RequestControl {
-    active: AtomicBool,
-    timed_out: AtomicBool,
-}
+/// Cancels only this request if dispatch or response-head waiting is dropped.
+struct RequestGuard(Option<CancellationToken>);
 
-impl RequestControl {
-    fn new() -> Self {
-        Self {
-            active: AtomicBool::new(false),
-            timed_out: AtomicBool::new(false),
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
         }
     }
 }
@@ -129,7 +123,7 @@ pub(crate) struct ApplicationPool {
     dispatch: ApplicationDispatch,
     limits: ApplicationLimits,
     retry: ApplicationRetryPolicy,
-    admission: Semaphore,
+    admission: Arc<Semaphore>,
     /// Everything a replacement worker needs, kept because a slot may be
     /// refilled long after `start` returned.
     boot: WorkerBoot,
@@ -229,7 +223,7 @@ impl ApplicationPool {
             dispatch,
             limits,
             retry,
-            admission: Semaphore::new(limits.max_waiting()),
+            admission: Arc::new(Semaphore::new(limits.max_waiting())),
             boot,
             last_error: Mutex::new(None),
             #[cfg(feature = "websocket")]
@@ -344,7 +338,7 @@ impl ApplicationPool {
                 Some(worker) => {
                     snapshot.instances += 1;
                     snapshot.ready += 1;
-                    if worker.request_slot.available_permits() == 0 {
+                    if worker.counters.active.load(Ordering::Relaxed) != 0 {
                         snapshot.busy += 1;
                     }
                 }
@@ -366,20 +360,21 @@ impl ApplicationPool {
     /// Round-robin across the slots that currently hold a worker. A slot in
     /// backoff is skipped rather than dispatched into a closed channel.
     fn select_live(&self) -> Option<Arc<ApplicationWorker>> {
-        let live = self
-            .slots
-            .iter()
-            .filter_map(|slot| slot.live())
-            .collect::<Vec<_>>();
-        if live.is_empty() {
+        let count = self.slots.len();
+        if count == 0 {
             return None;
         }
-        let index = match self.dispatch {
-            ApplicationDispatch::RoundRobin => {
-                self.next.fetch_add(1, Ordering::Relaxed) % live.len()
+        let start = if count == 1 {
+            0
+        } else {
+            match self.dispatch {
+                ApplicationDispatch::RoundRobin => {
+                    self.next.fetch_add(1, Ordering::Relaxed) % count
+                }
             }
         };
-        Some(Arc::clone(&live[index]))
+        (0..count)
+            .find_map(|offset| self.slots[(start + offset) % count].live())
     }
 
     /// `queue_timeout` is the route's `requests.queue_timeout`: how long this
@@ -389,8 +384,11 @@ impl ApplicationPool {
         request: ApplicationRequest,
         queue_timeout: Option<Duration>,
     ) -> Result<ApplicationResponse> {
-        let _admission =
-            self.admission.try_acquire().map_err(|_| Error::AdmissionFull)?;
+        let admission = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::AdmissionFull)?;
         let worker = self.select_live().ok_or_else(|| {
             Error::ApplicationNotRunning(self.name.to_string())
         })?;
@@ -400,18 +398,6 @@ impl ApplicationPool {
             queue_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let expired =
             || Error::DispatchQueueTimedOut(queue_timeout.unwrap_or_default());
-        let slot = if immediate {
-            worker
-                .request_slot
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| expired())?
-        } else {
-            within(deadline, worker.request_slot.clone().acquire_owned())
-                .await
-                .ok_or_else(expired)?
-                .map_err(|_| Error::RequestChannelClosed)?
-        };
         let sender = if immediate {
             worker.sender.try_reserve().map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => expired(),
@@ -427,20 +413,24 @@ impl ApplicationPool {
         };
         let (started, accepted) = oneshot::channel();
         let (reply, response) = oneshot::channel();
-        let control = Arc::new(RequestControl::new());
+        let cancellation = CancellationToken::new();
+        let mut guard = RequestGuard(Some(cancellation.clone()));
+        worker.counters.active.fetch_add(1, Ordering::Relaxed);
         sender.send(WorkerCommand::Execute {
             request,
             started,
             reply,
-            control: Arc::clone(&control),
-            _slot: slot,
+            lifetime: RequestLifetime {
+                cancellation,
+                _admission: Some(admission),
+                counters: Some(Arc::clone(&worker.counters)),
+            },
         });
         if !immediate {
             match within(deadline, accepted).await {
                 Some(Ok(())) => {}
                 Some(Err(_)) => return Err(Error::RequestChannelClosed),
                 None => {
-                    expire_request(&control, &worker.isolate);
                     return Err(expired());
                 }
             }
@@ -450,16 +440,17 @@ impl ApplicationPool {
                 match tokio::time::timeout(timeout, response).await {
                     Ok(result) => result,
                     Err(_) => {
-                        expire_request(&control, &worker.isolate);
                         return Err(Error::ExecutionTimedOut(timeout));
                     }
                 }
             }
             None => response.await,
         };
-        result
+        let response = result
             .map_err(|_| Error::RequestChannelClosed)?
-            .map_err(Error::ApplicationUnavailable)
+            .map_err(Error::ApplicationUnavailable)?;
+        guard.0.take();
+        Ok(response)
     }
 
     #[cfg(feature = "orbit")]
@@ -478,6 +469,7 @@ impl ApplicationPool {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.admission.close();
         self.cancellation.cancel();
         let workers = self
             .slots
@@ -523,16 +515,6 @@ impl ApplicationPool {
             worker: candidates[index].sender.clone(),
             limits: self.websocket,
         })
-    }
-}
-
-fn expire_request(
-    control: &RequestControl,
-    isolate: &v8::IsolateHandle,
-) {
-    control.timed_out.store(true, Ordering::SeqCst);
-    if control.active.load(Ordering::SeqCst) {
-        isolate.terminate_execution();
     }
 }
 
@@ -624,8 +606,7 @@ async fn start_worker(
 ) -> Result<ApplicationWorker> {
     let (sender, mut receiver) = mpsc::channel(boot.command_queue_capacity);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let served = Arc::new(AtomicU64::new(0));
-    let thread_served = Arc::clone(&served);
+    let counters = Arc::new(RequestCounters::default());
     let thread_name = format!("js:{}:{instance}", boot.definition.name());
     let thread = std::thread::Builder::new()
         .name(thread_name)
@@ -652,7 +633,7 @@ async fn start_worker(
                     )
                     .await
                     {
-                        Ok(mut application) => {
+                        Ok(application) => {
                             let supports_websocket = {
                                 #[cfg(feature = "websocket")]
                                 {
@@ -663,8 +644,7 @@ async fn start_worker(
                                     false
                                 }
                             };
-                            let isolate = application.isolate_handle();
-                            let _ = ready_tx.send(Ok((supports_websocket, isolate)));
+                            let _ = ready_tx.send(Ok(supports_websocket));
                             application
                         }
                         Err(error) => {
@@ -682,7 +662,9 @@ async fn start_worker(
                             command = receiver.recv() => command,
                             result = application.drive_event_loop() => {
                                 if let Err(error) = result {
-                                    error!(application = application.definition().name(), %error, "JavaScript background task failed");
+                                    error!(application = application.definition().name(), %error, "JavaScript event loop failed");
+                                    let _ = exits.send(WorkerExit { instance, generation, error: Some(error.to_string()) });
+                                    break;
                                 }
                                 drive_runtime = false;
                                 continue;
@@ -693,13 +675,9 @@ async fn start_worker(
                     };
 
                     let Some(command) = command else { break };
-                    let executed = matches!(command, WorkerCommand::Execute { .. });
                     if !handle_command(&mut application, command, boot.graceful_timeout).await {
                         shutdown_requested = true;
                         break;
-                    }
-                    if executed {
-                        thread_served.fetch_add(1, Ordering::Relaxed);
                     }
                     drive_runtime = true;
                 }
@@ -712,16 +690,14 @@ async fn start_worker(
         })
         .map_err(|error| Error::ApplicationUnavailable(error.to_string()))?;
 
-    let (_supports_websocket, isolate) = ready_rx
+    let _supports_websocket = ready_rx
         .await
         .map_err(|_| Error::RequestChannelClosed)?
         .map_err(Error::ApplicationUnavailable)?;
     Ok(ApplicationWorker {
         sender,
-        request_slot: Arc::new(Semaphore::new(1)),
-        isolate,
         thread: Mutex::new(Some(thread)),
-        served,
+        counters,
         #[cfg(feature = "websocket")]
         supports_websocket: _supports_websocket,
     })
@@ -733,59 +709,32 @@ async fn handle_command(
     graceful_timeout: Option<Duration>,
 ) -> bool {
     match command {
-        WorkerCommand::Execute { request, started, reply, control, _slot } => {
-            if control.timed_out.load(Ordering::SeqCst) {
-                return true;
-            }
-            control.active.store(true, Ordering::SeqCst);
-            if control.timed_out.load(Ordering::SeqCst) {
-                control.active.store(false, Ordering::SeqCst);
-                application.cancel_terminate_execution();
+        WorkerCommand::Execute { request, started, reply, lifetime } => {
+            if lifetime.cancellation.is_cancelled() {
                 return true;
             }
             let _ = started.send(());
-            // The head goes to `reply` from inside the isolate as soon as the
-            // handler answers; this returns once the body is written, which
-            // is how long the request holds its isolate.
-            if let Err(error) = application.handle(request, reply).await {
-                tracing::debug!(%error, "JavaScript application request ended with an error");
-            }
-            control.active.store(false, Ordering::SeqCst);
-            if control.timed_out.load(Ordering::SeqCst) {
-                application.cancel_terminate_execution();
+            if let Err(error) =
+                application.start_request(request, reply, lifetime)
+            {
+                tracing::debug!(%error, "JavaScript application request could not start");
             }
         }
         #[cfg(feature = "orbit")]
         WorkerCommand::ApplicationEvent { event, reply } => {
-            let result = application
-                .application_event(event)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
+            application.application_event(event, reply);
         }
         #[cfg(feature = "websocket")]
         WorkerCommand::WebSocketOpen { event, actions, reply } => {
-            let result = application
-                .websocket_open(event, actions)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
+            application.websocket_open(event, actions, reply);
         }
         #[cfg(feature = "websocket")]
         WorkerCommand::WebSocketEvent { event, reply } => {
-            let result = application
-                .websocket_event(event)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
+            application.websocket_event(event, reply);
         }
         #[cfg(feature = "websocket")]
         WorkerCommand::WebSocketClose { event, reply } => {
-            let result = application
-                .websocket_close(event)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = reply.send(result);
+            application.websocket_close(event, reply);
         }
         WorkerCommand::Shutdown => {
             // Stopping waits for the work this isolate already accepted.
@@ -854,7 +803,7 @@ async fn supervise(
             // A worker the pool already dropped was replaced or shut down
             // deliberately; its exit is not a failure.
             let served = match slot.worker.lock().unwrap().take() {
-                Some(worker) => worker.served.load(Ordering::Relaxed),
+                Some(worker) => worker.counters.served.load(Ordering::Relaxed),
                 None => continue,
             };
             pool.record_failure(

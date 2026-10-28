@@ -27,8 +27,31 @@ export default {
 
 Modules load once per isolate generation. Module state persists across requests;
 each configured instance has its own state. Each isolate stays on one OS thread
-and handles one request at a time. The managed pool distributes requests across
-instances and continues driving the JavaScript event loop between requests.
+and advances multiple asynchronous requests through one event loop. A handler
+waiting for I/O or response backpressure does not reserve the isolate. Additional
+instances provide independent module state and CPU parallelism; they are not
+required for concurrent HTTP requests.
+
+Request state, cancellation and response completion belong to each request.
+Static responses cross the bridge as complete bytes; live bodies use a bounded
+channel created only for that response. Buffering and delivery follow Claviron's
+shared HTTP policy. GET/HEAD dispatch never reads or inspects a request body;
+other bodyless methods use the transport's existing end-of-stream metadata.
+
+`max_waiting` bounds accepted requests, including unfinished response producers.
+`execution_timeout` bounds the wait from acceptance to response headers. Expiry
+signals that request's `AbortSignal` and cancels its bridge I/O; it does not
+terminate the shared isolate. Synchronous JavaScript still runs on one thread:
+a handler that never yields can block that isolate, and cooperative cancellation
+cannot preempt it.
+
+The explicit `http-concurrency` example exercises overlapping request bodies,
+open response streams, disconnects, producer errors and graceful drain without
+binding a network listener or creating fleet resources:
+
+```sh
+cargo run --example http-concurrency --all-features
+```
 
 Local JavaScript, JSX, TypeScript and TSX modules are supported. TypeScript is
 transpiled during loading; type-check it separately in your application's build.

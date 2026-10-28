@@ -10,6 +10,7 @@ const {
     op_claviron_application_request,
     op_claviron_application_request_body,
     op_claviron_application_request_read,
+    op_claviron_application_response_whole,
     op_claviron_application_response_head,
     op_claviron_application_response_write,
 } = core.ops;
@@ -39,24 +40,28 @@ const runtime = Object.freeze({
         return op_claviron_runtime_yield(value);
     },
 
-    takeApplicationRequest() {
-        return op_claviron_application_request();
+    takeApplicationRequest(id) {
+        return op_claviron_application_request(id);
     },
 
-    takeApplicationRequestBody() {
-        return op_claviron_application_request_body();
+    takeApplicationRequestBody(id) {
+        return op_claviron_application_request_body(id);
     },
 
-    readRequestBody() {
-        return op_claviron_application_request_read();
+    readRequestBody(id) {
+        return op_claviron_application_request_read(id);
     },
 
-    respondHead(head) {
-        op_claviron_application_response_head(head);
+    respondWhole(id, head, body) {
+        return op_claviron_application_response_whole(id, head, body);
     },
 
-    writeBody(chunk) {
-        return op_claviron_application_response_write(chunk);
+    respondHead(id, head) {
+        return op_claviron_application_response_head(id, head);
+    },
+
+    writeBody(id, chunk) {
+        return op_claviron_application_response_write(id, chunk);
     },
 });
 

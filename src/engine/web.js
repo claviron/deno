@@ -66,18 +66,41 @@
         #bytes;
         bodyUsed = false;
 
-        constructor(body) { this.#bytes = bodyBytes(body); }
+        constructor(body) { this.#bytes = body instanceof ReadableStream ? body : bodyBytes(body); }
         get body() { return this.#bytes; }
         async arrayBuffer() {
+            if (this.bodyUsed) throw new TypeError("Body already consumed");
             this.bodyUsed = true;
+            if (this.#bytes instanceof ReadableStream) {
+                const reader = this.#bytes.getReader();
+                const chunks = [];
+                let size = 0;
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        size += value.length;
+                    }
+                } finally { reader.releaseLock(); }
+                const bytes = new Uint8Array(size);
+                let offset = 0;
+                for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+                return bytes.buffer;
+            }
             return this.#bytes.buffer.slice(
                 this.#bytes.byteOffset,
                 this.#bytes.byteOffset + this.#bytes.byteLength,
             );
         }
-        async text() { this.bodyUsed = true; return decoder.decode(this.#bytes); }
+        async text() { return decoder.decode(await this.arrayBuffer()); }
         async json() { return JSON.parse(await this.text()); }
         _copyBody() { return this.#bytes.slice(); }
+        _takeBody() {
+            if (this.bodyUsed) throw new TypeError("Body already consumed");
+            this.bodyUsed = true;
+            return this.#bytes;
+        }
     }
 
     class Request extends Body {
@@ -89,6 +112,7 @@
             this.headers = new Headers(init.headers ?? source?.headers);
             this.redirect = init.redirect ?? source?.redirect ?? "follow";
             this.credentials = init.credentials ?? source?.credentials ?? "same-origin";
+            this.signal = init.signal ?? source?.signal ?? new AbortController().signal;
         }
         clone() { return new Request(this); }
     }
@@ -122,4 +146,7 @@
     }
 
     Object.assign(globalThis, { Headers, Request, Response });
+    Object.defineProperty(globalThis, Symbol.for("claviron.response.body"), {
+        value: (response) => response._takeBody(),
+    });
 })();

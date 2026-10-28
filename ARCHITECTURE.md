@@ -64,16 +64,38 @@ the worker identity and delivers those records to journald under systemd.
 An application entry is a persistent ES module whose default export is either
 a Fetch-style function or an object with `fetch(request)`. Module boot happens
 once per application generation. Each configured instance owns one V8 isolate
-on one OS thread and handles one request at a time. Requests are distributed
-round-robin across the application's instances through a bounded typed
-mailbox; a live `JsRuntime` never crosses the channel.
+on one OS thread. The owner starts calls without awaiting each call to
+completion, then polls its command mailbox, the V8 event loop and pending call
+completions together. Requests are distributed round-robin through the existing
+bounded typed mailbox; a live `JsRuntime` never crosses the channel. A handler's
+asynchronous wait does not reserve an instance. Synchronous JS remains serial.
+The per-instance one-request semaphore is removed.
 
 The bridge converts Claviron HTTP requests to Web `Request` values and Web
-`Response` values back to Claviron responses. Request and response bodies are
-buffered in this first implementation; streaming and cancellation propagation
-are later protocol additions. Persistent module state is intentional, so
-framework instances, dependency containers and connection clients may be
-created once and reused across requests.
+`Response` values back to Claviron responses. Each call owns a native request
+resource handle containing its request, reply, body endpoints, cancellation and
+admission lifetime. No singleton request/reply slots remain in `OpState`.
+Handles are exact JavaScript-safe 53-bit integers, never recycled or wrapped.
+Exhaustion rejects allocation instead of aliasing a retained handle. Resource mutation stays on the V8
+owner thread; a streamed read takes its receiver across the await and rejects
+concurrent reads instead of locking it.
+
+GET/HEAD dispatch does not inspect or collect a request body. Other methods use
+the transport's end-of-stream metadata before choosing whole or streamed input
+through `HttpPolicy`. Static replies use Deno's existing static-body
+representation and cross once as bytes, without creating a response channel,
+stream reader or pump. Live replies allocate their bounded channel on demand.
+`claviron-http::body::deliver_reply` owns delivery/buffering policy; the bridge
+has no SSE-specific dispatch or scheduling branch. Failed producers preserve an
+error after their queued bytes rather than reporting a successful EOF.
+
+Dropping an HTTP caller or live response cancels only its request. The owner
+signals its `AbortSignal`, wakes pending bridge I/O and keeps ownership of guest
+cleanup until the call settles. A request body pump also wakes when its consumer
+closes, even if its client sends no further frames. Normal static replies need
+no cancellation waiter registration when their promise is already complete.
+Persistent module state remains intentional, so framework instances, dependency
+containers and connection clients may be created once and reused.
 
 The HTTP adapter constructs the absolute Web Request URL from accepted
 transport scheme and request authority, preserving port, path and query.
@@ -90,9 +112,10 @@ do not reopen a CA path or depend on Deno CLI processing of `DENO_CERT` or
 `NODE_EXTRA_CA_CERTS`.
 
 `URL`, `URLSearchParams` and the foundational Web globals come from Deno's
-official Web extensions. The buffered `Headers`, `Request` and `Response`
-bridge remains Claviron-owned until the fetch extension is adopted; application
-code must not mistake that compatibility surface for outbound network access.
+official Web extensions. With `fetch`, Request/Response and static-body access
+use the compatible Deno Fetch extension. Without it, the small Claviron bridge
+provides inbound Request/Response only, including live bodies; it does not grant
+outbound network access.
 
 `CoreApplication` remains `!Send` because its V8 isolate stays on its owner OS
 thread. The server feature is the only layer allowed to decide thread and pool
@@ -128,8 +151,8 @@ Every application pool owns one cancellation token for its current generation.
 `claviron:runtime` exposes it as the synchronous `isCancelled()` check and the
 awaitable `cancelled()` notification. A named stop or restart and aggregate
 service cancellation cancel that token before queuing the shutdown command, so
-an active asynchronous request can observe cancellation even while it owns the
-isolate command loop. The later `shutdown()` hook is cleanup, not the first
+an active asynchronous request can observe cancellation while other requests continue through the same
+isolate event loop. The later `shutdown()` hook is cleanup, not the first
 delivery of the signal. A new application generation receives a fresh token.
 Embedded JavaScript tasks receive their occurrence token through the same
 runtime API.
@@ -225,7 +248,7 @@ The application service selects env notifications inside its existing runnable.
 Changed effective values renew only that named application through its joined
 stop/start path. Stopped applications retain their stopped state and use the
 latest valid values on their next start; invalid sources retain live execution.
-`engine.command_queue_capacity` bounds the serialized command mailbox of each
+`engine.command_queue_capacity` bounds the command mailbox of each
 isolate and defaults to 64. `engine.websocket` carries the transport limits
 the runtime applies around a socket rather than inside the isolate:
 `max_message_size` is the ceiling the frame collector reassembles to and the
@@ -235,15 +258,16 @@ one socket before it waits. Both are engine-wide for the same reason `fetch`
 is: they describe what the runtime does on the application's behalf, not how
 one application is dispatched. `config/js.yaml` spells out every accepted key
 at its default value, so the whole surface is readable without the schema. Every application separately declares its fixed
-request `dispatch` algorithm and `requests` policy. `round_robin` selects the
-next isolate in order; `max_waiting` bounds concurrent active and queued
-callers, `dispatch_queue_timeout` bounds waiting for that isolate's request
-slot, while `execution_timeout` bounds the accepted handler.
-The execution deadline is enforced against the owning V8 isolate rather than
-merely abandoning the HTTP response. `null` leaves execution intentionally
-unbounded. These application request budgets use the language-neutral
-`claviron-app::ApplicationRequestPolicy`; isolate selection and interruption
-remain JavaScript runtime behavior.
+request `dispatch` algorithm and execution limits. `round_robin` selects the
+next live instance without allocating a temporary list on each dispatch.
+`max_waiting` bounds queued and executing requests, including live response
+producers after their headers have been sent; its owned permit is released with
+actual guest completion. `requests.queue_timeout` bounds acceptance through the
+mailbox. `execution_timeout` bounds acceptance to the response head and cancels
+only that request cooperatively; `null` leaves it unbounded. It never invokes
+V8's isolate-wide `terminate_execution` for an individual request. A synchronous
+non-yielding handler cannot be safely preempted in isolation from its peers.
+No new hard interruption policy or duration is inferred.
 
 Each application also declares `retry`, the same `max_attempts` / `backoff` /
 `backoff_max` a PHP application declares, resolving to the shared
@@ -342,7 +366,12 @@ a fresh generation from the retained definitions. Each owner thread drives
 both its command mailbox and the V8 event
 loop. Detached promises and timers therefore continue while no HTTP, WebSocket,
 or fleet-event command is arriving; incoming commands can still interrupt the
-event-loop wait and retain serialized isolate ownership.
+event-loop wait and retain single-threaded isolate ownership. Non-HTTP callback promises are
+tracked by the same owner so an asynchronous event callback does not monopolize
+HTTP acceptance. Shutdown closes admission, signals accepted calls through their AbortSignals
+and drains them before invoking the application cleanup hook. Pending guest
+work remains owned under the declared graceful policy; background timers are
+left for the cleanup hook before the final event-loop drain.
 
 `JsApplicationService` is also the authoritative owner of each named
 application's desired enabled state, lifecycle, generation, live pool and last

@@ -120,7 +120,7 @@ impl JsConfig {
 pub struct EngineConfig {
     pub fetch: FetchConfig,
     pub websocket: WebSocketConfig,
-    /// Commands waiting for one serialized application isolate.
+    /// Commands waiting for an application isolate owner.
     #[serde(default = "default_command_queue_capacity")]
     pub command_queue_capacity: usize,
     /// How long a stopping isolate may take to finish the work it already
@@ -203,12 +203,13 @@ pub struct ApplicationConfig {
     pub instances: usize,
     #[serde(default)]
     pub dispatch: ApplicationDispatch,
-    /// Callers admitted at once, running and waiting for an isolate.
+    /// Requests admitted at once, including live response producers.
     #[serde(default = "default_max_waiting")]
     pub max_waiting: usize,
-    /// Hard budget for one accepted handler; `null` leaves it unbounded. An
-    /// expired handler is terminated inside its isolate. Running, not request
-    /// handling: the wait for an isolate is the route's `requests.queue_timeout`.
+    /// Budget from acceptance to the response head; `null` leaves it unbounded.
+    /// Expiry cancels this request cooperatively through its AbortSignal and
+    /// bridge I/O. It never terminates other calls in the shared isolate.
+    /// The wait for acceptance is the route's `requests.queue_timeout`.
     #[serde(
         default = "default_execution_timeout",
         deserialize_with = "claviron::helpers::de::deserialize_optional_duration"

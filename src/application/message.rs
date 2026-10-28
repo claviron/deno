@@ -15,34 +15,28 @@ pub struct ApplicationRequest {
 /// request policy chooses (`requests.buffering`, `buffer_size`).
 #[derive(Debug)]
 pub enum RequestBody {
+    /// No body crosses the application boundary.
+    Empty,
     Whole(Vec<u8>),
     /// Pieces as they arrive; an error ends the body as a failed read.
     Stream(mpsc::Receiver<Result<bytes::Bytes, String>>),
 }
 
 /// Framework-neutral response returned by a JavaScript Fetch handler: its
-/// head, and its body as it is produced. The head is handed over as soon as
-/// the handler returns its `Response`; the body follows piece by piece while
-/// the isolate keeps running, so a stream (SSE, a download) reaches the client
-/// as it is written. Whether it is held instead is the reply policy's.
+/// head and either complete bytes or a live body. Static replies need no channel;
+/// a live reply's head is handed over before its body finishes. The shared HTTP
+/// policy decides whether live pieces are buffered before reaching the client.
 #[derive(Debug)]
 pub struct ApplicationResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: mpsc::Receiver<bytes::Bytes>,
+    pub body: super::ResponseBody,
 }
 
 /// Where the head goes when the handler answers, and an error when it never
 /// does.
 pub type ReplySender =
     oneshot::Sender<std::result::Result<ApplicationResponse, String>>;
-
-/// The reply sender, waiting in the isolate's state for the handler's head.
-pub(crate) struct PendingReply(pub ReplySender);
-
-/// Where the body's pieces go once the head is out. Dropped when the handler
-/// finishes, which ends the body.
-pub(crate) struct ResponseBodySender(pub mpsc::Sender<bytes::Bytes>);
 
 /// Pieces of a reply in flight between the isolate and the client. Small on
 /// purpose, as SAPI's: a client that stops reading is felt by the handler at
@@ -58,14 +52,6 @@ pub(crate) struct PendingRequest {
     pub body: Vec<u8>,
 }
 
-/// A streamed request body, read piece by piece by the isolate. Shared so an
-/// op can wait on it without holding the isolate's state borrowed.
-pub(crate) struct PendingRequestStream(
-    pub  std::rc::Rc<
-        tokio::sync::Mutex<mpsc::Receiver<Result<bytes::Bytes, String>>>,
-    >,
-);
-
 /// What crosses as JSON of a request: everything but the body, and whether
 /// the body comes whole or as a stream.
 #[derive(Serialize)]
@@ -74,6 +60,7 @@ pub(crate) struct RequestHead<'a> {
     pub url: &'a str,
     pub headers: &'a [(String, String)],
     pub streamed: bool,
+    pub has_body: bool,
 }
 
 /// What crosses as JSON of a reply: everything but the body.

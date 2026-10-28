@@ -22,7 +22,7 @@ pub mod task;
 
 pub use application::{
     ApplicationDefinition, ApplicationRequest, ApplicationResponse,
-    CoreApplication, RequestBody,
+    CoreApplication, RequestBody, ResponseBody, ResponseStream,
 };
 pub use error::{Error, Result};
 pub use extensions::ExtensionContext;

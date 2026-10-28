@@ -69,30 +69,38 @@ impl JsApplicationAdapter {
             .copied()
             .unwrap_or(HttpPolicy::unlimited())
             .narrow(&self.route);
-        // Whole or piece by piece, as the request policy says: the isolate
-        // takes either, as a buffer or as the `Request`'s stream.
-        let declared = http_body::Body::size_hint(&body).exact();
-        let whole = http_body::Body::is_end_stream(&body)
-            || policy
+        // Fetch GET/HEAD never carry a request body. Do not collect, size,
+        // guard or pump one here. Framing remains the HTTP transport's job.
+        let body = if parts.method == http::Method::GET
+            || parts.method == http::Method::HEAD
+            || http_body::Body::is_end_stream(&body)
+        {
+            crate::RequestBody::Empty
+        } else {
+            let declared = http_body::Body::size_hint(&body).exact();
+            if policy
                 .requests
                 .delivery(
                     claviron::http::policy::BodyNeed::Stream,
                     declared,
                     false,
                 )
-                .takes_whole(declared);
-        let body = if whole {
-            crate::RequestBody::Whole(
-                body.collect()
-                    .await
-                    .map_err(|error| {
-                        crate::Error::ApplicationUnavailable(error.to_string())
-                    })?
-                    .to_bytes()
-                    .to_vec(),
-            )
-        } else {
-            crate::RequestBody::Stream(pump_request_body(body))
+                .takes_whole(declared)
+            {
+                crate::RequestBody::Whole(
+                    body.collect()
+                        .await
+                        .map_err(|error| {
+                            crate::Error::ApplicationUnavailable(
+                                error.to_string(),
+                            )
+                        })?
+                        .to_bytes()
+                        .to_vec(),
+                )
+            } else {
+                crate::RequestBody::Stream(pump_request_body(body))
+            }
         };
         let url = application_url(&parts)?;
         let request = ApplicationRequest {
@@ -130,14 +138,20 @@ impl JsApplicationAdapter {
                 })?;
             headers.append(name, value);
         }
-        // Held or passed on as it comes, as the reply's head and its policy
-        // say — the same rule SAPI follows.
-        let body = claviron::http::body::deliver_reply(
-            &mut headers,
-            boxed_body(ReplyBody(response.body)),
-            &policy.responses,
-        )
-        .await;
+        let body = match response.body {
+            crate::ResponseBody::Whole(bytes) => {
+                headers.remove(claviron::http::policy::X_ACCEL_BUFFERING);
+                claviron::http::bytes_body(bytes)
+            }
+            crate::ResponseBody::Stream(stream) => {
+                claviron::http::body::deliver_reply(
+                    &mut headers,
+                    boxed_body(ReplyBody(stream)),
+                    &policy.responses,
+                )
+                .await
+            }
+        };
         let mut reply = Response::new(body);
         *reply.status_mut() = status;
         *reply.headers_mut() = headers;
@@ -220,11 +234,11 @@ mod tests;
 
 /// A reply's body as the isolate writes it, one piece per `writeBody`. Ends
 /// when the handler finishes and its sender is dropped.
-struct ReplyBody(tokio::sync::mpsc::Receiver<bytes::Bytes>);
+struct ReplyBody(crate::ResponseStream);
 
 impl http_body::Body for ReplyBody {
     type Data = bytes::Bytes;
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         mut self: std::pin::Pin<&mut Self>,
@@ -232,9 +246,11 @@ impl http_body::Body for ReplyBody {
     ) -> std::task::Poll<
         Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>,
     > {
-        self.0
-            .poll_recv(context)
-            .map(|chunk| chunk.map(|chunk| Ok(http_body::Frame::data(chunk))))
+        self.0.poll_recv(context).map(|chunk| {
+            chunk.map(|chunk| {
+                chunk.map(http_body::Frame::data).map_err(std::io::Error::other)
+            })
+        })
     }
 }
 
@@ -250,7 +266,13 @@ fn pump_request_body(
 ) -> tokio::sync::mpsc::Receiver<std::result::Result<bytes::Bytes, String>> {
     let (sender, receiver) = tokio::sync::mpsc::channel(REQUEST_BODY_CAPACITY);
     tokio::spawn(async move {
-        while let Some(frame) = body.frame().await {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                frame = body.frame() => frame,
+            };
+            let Some(frame) = frame else { return };
             let sent = match frame {
                 Ok(frame) => match frame.into_data() {
                     Ok(data) if data.is_empty() => continue,
