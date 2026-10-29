@@ -50,7 +50,6 @@ server = [
     "dep:claviron",
     "claviron/application",
     "claviron/axum",
-    "dep:http",
     "dep:http-body",
     "dep:http-body-util",
     "dep:serde_yaml",
@@ -89,7 +88,7 @@ deno_web = "0.291.0"
 deno_webidl = "0.260.0"
 futures-util = { version = "0.3", optional = true }
 fastwebsockets = { version = "0.10", optional = true }
-http = { version = "1", optional = true }
+http = "1"
 http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", features = ["server", "http2", "http1", "client"], optional = true }

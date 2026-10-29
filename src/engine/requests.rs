@@ -8,10 +8,7 @@ use deno_core::futures::{FutureExt, StreamExt};
 use deno_core::v8;
 
 use super::CoreEngine;
-use crate::application::{
-    PendingRequest, RequestHead, RequestLifetime, RequestResource,
-    RequestResources,
-};
+use crate::application::{RequestLifetime, RequestResource, RequestResources};
 use crate::{ApplicationRequest, Error, RequestBody, Result};
 
 type Call = LocalBoxFuture<
@@ -62,7 +59,8 @@ impl CoreEngine {
     ) -> Result<(u64, Call, tokio_util::sync::CancellationToken)> {
         let function =
             self.dispatch.as_ref().ok_or(Error::InvalidApplicationResponse)?;
-        let (body, input, has_body) = match request.body {
+        let (parts, body) = request.into_parts();
+        let (body, input, has_body) = match body {
             RequestBody::Empty => (Vec::new(), None, false),
             RequestBody::Whole(body) => {
                 let has_body = !body.is_empty();
@@ -70,13 +68,7 @@ impl CoreEngine {
             }
             RequestBody::Stream(input) => (Vec::new(), Some(input), true),
         };
-        let head = serde_json::to_string(&RequestHead {
-            method: &request.method,
-            url: &request.url,
-            headers: &request.headers,
-            streamed: input.is_some(),
-            has_body,
-        })?;
+        let streamed = input.is_some();
         let cancellation = lifetime.cancellation.clone();
         let id = self
             .runtime
@@ -84,7 +76,7 @@ impl CoreEngine {
             .borrow_mut()
             .borrow_mut::<RequestResources>()
             .insert(RequestResource {
-                request: RefCell::new(Some(PendingRequest { head, body })),
+                request_body: RefCell::new(Some(body)),
                 has_input: input.is_some(),
                 input: RefCell::new(input),
                 reply: RefCell::new(Some(reply)),
@@ -94,13 +86,65 @@ impl CoreEngine {
                 closed: Cell::new(false),
             })
             .map_err(|error| Error::ApplicationUnavailable(error.into()))?;
-        let argument = {
+        let arguments: Result<[v8::Global<v8::Value>; 6]> = (|| {
             deno_core::scope!(scope, self.runtime);
-            let id = v8::Number::new(scope, id as f64);
-            v8::Global::new(scope, v8::Local::<v8::Value>::from(id))
+            let string = |value: &str| {
+                v8::String::new(scope, value).ok_or_else(|| {
+                    Error::ApplicationUnavailable(
+                        "request string exceeds V8 limits".into(),
+                    )
+                })
+            };
+            let method = string(parts.method.as_str())?;
+            let url = string(&parts.uri.to_string())?;
+            let mut headers = Vec::with_capacity(parts.headers.len());
+            for (name, value) in &parts.headers {
+                let name = string(name.as_str())?;
+                // HTTP field values and Fetch ByteStrings use Latin-1, not UTF-8.
+                let value = v8::String::new_from_one_byte(
+                    scope,
+                    value.as_bytes(),
+                    v8::NewStringType::Normal,
+                )
+                .ok_or_else(|| {
+                    Error::ApplicationUnavailable(
+                        "request header exceeds V8 limits".into(),
+                    )
+                })?;
+                let pair = v8::Array::new_with_elements(
+                    scope,
+                    &[name.into(), value.into()],
+                );
+                headers.push(pair.into());
+            }
+            let headers = v8::Array::new_with_elements(scope, &headers);
+            let arguments: [v8::Local<v8::Value>; 6] = [
+                v8::Number::new(scope, id as f64).into(),
+                method.into(),
+                url.into(),
+                headers.into(),
+                v8::Boolean::new(scope, streamed).into(),
+                v8::Boolean::new(scope, has_body).into(),
+            ];
+            Ok(arguments.map(|value| v8::Global::new(scope, value)))
+        })();
+        let arguments = match arguments {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                if let Some(resource) = self
+                    .runtime
+                    .op_state()
+                    .borrow_mut()
+                    .borrow_mut::<RequestResources>()
+                    .take(id)
+                {
+                    resource.finish(Err(error.to_string()));
+                }
+                return Err(error);
+            }
         };
         let call =
-            self.runtime.call_with_args(function, &[argument]).boxed_local();
+            self.runtime.call_with_args(function, &arguments).boxed_local();
         Ok((id, call, cancellation))
     }
 

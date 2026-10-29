@@ -17,7 +17,7 @@ fn fetch_url_preserves_authority_path_and_query_with_the_accepted_scheme() {
                 .0;
             parts.extensions.insert(scheme.clone());
             assert_eq!(
-                application_url(&parts).unwrap(),
+                application_uri(&parts).unwrap().to_string(),
                 format!("{scheme}://{authority}/app/a%2Fb?q=%2F")
             );
             assert_eq!(parts.uri, "/app/a%2Fb?q=%2F");
@@ -30,7 +30,7 @@ fn fetch_url_preserves_authority_path_and_query_with_the_accepted_scheme() {
         .into_parts()
         .0;
     parts.extensions.insert(Scheme::HTTP);
-    assert_eq!(application_url(&parts).unwrap(), "http://app.test:8080/x?y=1");
+    assert_eq!(application_uri(&parts).unwrap(), "http://app.test:8080/x?y=1");
     assert_eq!(parts.uri, "https://app.test:8080/x?y=1");
 }
 
@@ -43,10 +43,10 @@ fn missing_context_does_not_invent_https_or_localhost() {
         .unwrap()
         .into_parts()
         .0;
-    assert!(application_url(&parts).is_err());
+    assert!(application_uri(&parts).is_err());
     parts.extensions.insert(http::uri::Scheme::HTTP);
     parts.headers.remove(http::header::HOST);
-    assert!(application_url(&parts).is_err());
+    assert!(application_uri(&parts).is_err());
 }
 
 #[tokio::test]

@@ -135,31 +135,104 @@ async fn carries_request_and_reply_bodies_as_bytes() {
     // The body flows only while the handler runs, so it is read alongside.
     let (handled, received) = tokio::join!(
         engine.handle(
-            crate::ApplicationRequest {
-                method: "POST".to_owned(),
-                url: "http://test.local/echo".to_owned(),
-                headers: vec![(
-                    "content-type".to_owned(),
-                    "application/octet-stream".to_owned()
-                )],
-                body: crate::RequestBody::Whole(body.clone())
-            },
+            http::Request::builder()
+                .method("POST")
+                .uri("http://example.test/echo")
+                .header("content-type", "application/octet-stream")
+                .body(crate::RequestBody::Whole(body.clone()))
+                .unwrap(),
             reply
         ),
         async {
             let mut response = replied.await.unwrap().unwrap();
             let mut received = Vec::new();
-            while let Some(chunk) = response.body.recv().await {
+            while let Some(chunk) = response.body_mut().recv().await {
                 received.extend_from_slice(&chunk.unwrap());
             }
-            (response.status, response.headers, received)
+            let (parts, _) = response.into_parts();
+            (parts.status, parts.headers, received)
         }
     );
     handled.unwrap();
     let (status, headers, received) = received;
     assert_eq!(status, 201);
-    assert!(headers.contains(&("x-length".to_owned(), body.len().to_string())));
+    assert_eq!(headers["x-length"], body.len().to_string());
     assert_eq!(received, body);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_http_metadata_survives_without_json_for_whole_and_streamed_replies()
+ {
+    let directory = tempdir().unwrap();
+    let main_module = directory.path().join("application.js");
+    fs::write(&main_module, r#"
+        JSON.parse = JSON.stringify = () => { throw new Error("JSON bridge used"); };
+        export default async function (request) {
+            if (request.method !== "PATCH" || !request.url.endsWith("?value=%C4%B1") ||
+                request.headers.get("x-byte") !== "caf\u00e9" ||
+                request.headers.get("x-repeat") !== "one, two") {
+                throw new Error("request metadata changed");
+            }
+            const bytes = new Uint8Array(await request.arrayBuffer());
+            const body = request.url.includes("/stream?")
+                ? new ReadableStream({start(controller) { controller.enqueue(bytes); controller.close(); }})
+                : bytes;
+            const response = new Response(body, {status: 207, headers: [
+                ["x-byte", "caf\u00e9"], ["x-repeat", "one"], ["x-repeat", "two"],
+                ["set-cookie", "a=1"], ["set-cookie", "b=2"]
+            ]});
+            const entries = Array.from(response.headers);
+            const name = entries[0][0];
+            Object.defineProperty(entries[0], 0, {get() {
+                if (!globalThis[Symbol.for("claviron.runtime")].runtimeAvailable()) throw new Error("reentry failed");
+                return name;
+            }});
+            response.headers[Symbol.iterator] = () => entries.values();
+            return response;
+        }
+    "#).unwrap();
+    let mut engine =
+        CoreEngine::with_context(ExtensionContext::new("metadata"), &[])
+            .unwrap();
+    engine.boot(&main_module).await.unwrap();
+    for path in ["whole", "stream"] {
+        let mut request = http::Request::builder()
+            .method("PATCH")
+            .uri(format!("http://example.test/{path}?value=%C4%B1"))
+            .header("x-repeat", "one")
+            .header("x-repeat", "two")
+            .body(crate::RequestBody::Whole(vec![0, 128, 255]))
+            .unwrap();
+        request.headers_mut().insert(
+            "x-byte",
+            http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        let (handled, response) =
+            tokio::join!(engine.handle(request, reply), async {
+                let mut response = replied.await.unwrap().unwrap();
+                assert_eq!(response.status(), 207);
+                assert_eq!(response.headers()["x-byte"].as_bytes(), b"caf\xe9");
+                assert_eq!(response.headers()["x-repeat"], "one, two");
+                #[cfg(feature = "fetch")]
+                assert_eq!(
+                    response
+                        .headers()
+                        .get_all("set-cookie")
+                        .iter()
+                        .map(|value| value.as_bytes())
+                        .collect::<Vec<_>>(),
+                    [b"a=1".as_slice(), b"b=2".as_slice()]
+                );
+                let mut body = Vec::new();
+                while let Some(chunk) = response.body_mut().recv().await {
+                    body.extend_from_slice(&chunk.unwrap());
+                }
+                body
+            });
+        handled.unwrap();
+        assert_eq!(response, [0, 128, 255]);
+    }
 }
 
 /// A streamed request body reaches the handler as its `ReadableStream`,
@@ -195,12 +268,11 @@ async fn streams_a_request_body_and_fails_a_cut_one() {
     for cut in [false, true] {
         let (pieces, receiver) = tokio::sync::mpsc::channel(1);
         let (reply, replied) = tokio::sync::oneshot::channel();
-        let request = crate::ApplicationRequest {
-            method: "POST".to_owned(),
-            url: "http://test.local/echo".to_owned(),
-            headers: Vec::new(),
-            body: crate::RequestBody::Stream(receiver),
-        };
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://example.test/echo")
+            .body(crate::RequestBody::Stream(receiver))
+            .unwrap();
         let (handled, _, (status, received)) = tokio::join!(
             engine.handle(request, reply),
             async move {
@@ -223,10 +295,10 @@ async fn streams_a_request_body_and_fails_a_cut_one() {
             async {
                 let mut response = replied.await.unwrap().unwrap();
                 let mut received = Vec::new();
-                while let Some(chunk) = response.body.recv().await {
+                while let Some(chunk) = response.body_mut().recv().await {
                     received.extend_from_slice(&chunk.unwrap());
                 }
-                (response.status, received)
+                (response.status().as_u16(), received)
             }
         );
         handled.unwrap();

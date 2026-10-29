@@ -66,7 +66,9 @@ impl JsWebSocketUpgradeHandler {
             return err_status(StatusCode::INTERNAL_SERVER_ERROR);
         };
         let (parts, body) = request.into_parts();
-        let url = match super::adapter::application_url(&parts) {
+        let url = match super::adapter::application_uri(&parts)
+            .map(|uri| uri.to_string())
+        {
             Ok(url) => match url.strip_prefix("https:") {
                 Some(rest) => format!("wss:{rest}"),
                 None => format!(

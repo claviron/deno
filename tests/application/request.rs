@@ -3,7 +3,7 @@ use super::*;
 fn resource(reply: ReplySender) -> RequestResource {
     RequestResource {
         has_input: false,
-        request: RefCell::new(None),
+        request_body: RefCell::new(None),
         input: RefCell::new(None),
         reply: RefCell::new(Some(reply)),
         output: RefCell::new(None),
@@ -80,11 +80,9 @@ async fn admission_outlives_the_response_head_and_releases_with_execution() {
         .borrow_mut()
         .take()
         .unwrap()
-        .send(Ok(crate::ApplicationResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: ResponseBody::Whole(Bytes::new()),
-        }))
+        .send(Ok(crate::ApplicationResponse::new(ResponseBody::Whole(
+            Bytes::new(),
+        ))))
         .unwrap();
     replied.await.unwrap().unwrap();
     assert_eq!(admission.available_permits(), 0);

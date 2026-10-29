@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::{PendingRequest, ReplySender};
+use super::ReplySender;
 
 /// A complete response avoids a channel; a live producer allocates one on demand.
 #[derive(Debug)]
@@ -121,7 +121,7 @@ impl Drop for RequestLifetime {
 
 pub(crate) struct RequestResource {
     pub has_input: bool,
-    pub request: RefCell<Option<PendingRequest>>,
+    pub request_body: RefCell<Option<Vec<u8>>>,
     // A read takes this receiver until it completes; concurrent reads are rejected.
     pub input: RefCell<Option<mpsc::Receiver<Result<Bytes, String>>>>,
     pub reply: RefCell<Option<ReplySender>>,
@@ -139,7 +139,7 @@ impl RequestResource {
         if self.closed.replace(true) {
             return;
         }
-        self.request.borrow_mut().take();
+        self.request_body.borrow_mut().take();
         self.input.borrow_mut().take();
         let streaming = self.output.borrow_mut().take().is_some();
         if let Some(reply) = self.reply.borrow_mut().take() {

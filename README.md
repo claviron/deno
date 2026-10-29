@@ -38,6 +38,13 @@ channel created only for that response. Buffering and delivery follow Claviron's
 shared HTTP policy. GET/HEAD dispatch never reads or inspects a request body;
 other bodyless methods use the transport's existing end-of-stream metadata.
 
+The Rust embedding API uses `ApplicationRequest` and `ApplicationResponse` as
+aliases for `http::Request<RequestBody>` and `http::Response<ResponseBody>`.
+Build requests with `http::Request::builder()` and access responses through the
+standard `status()`, `headers()` and body methods. HTTP parts move through the
+mailbox without rebuilding method/header strings. Metadata crosses into V8 as
+native values, with no JSON head encoding or parsing.
+
 `max_waiting` bounds accepted requests, including unfinished response producers.
 `execution_timeout` bounds the wait from acceptance to response headers. Expiry
 signals that request's `AbortSignal` and cancels its bridge I/O; it does not

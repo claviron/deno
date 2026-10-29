@@ -3,11 +3,11 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
-use deno_core::{Extension, OpState, op2};
+use deno_core::{Extension, OpState, op2, v8};
 
 use crate::ExtensionContext;
 use crate::application::{
-    RESPONSE_BODY_CAPACITY, RequestResource, RequestResources, ResponseHead,
+    RESPONSE_BODY_CAPACITY, RequestResource, RequestResources,
 };
 
 #[op2]
@@ -64,30 +64,15 @@ fn request_resource(
 }
 
 #[op2]
-#[string]
-fn op_claviron_application_request(
-    state: &OpState,
-    #[number] id: u64,
-) -> Result<String, deno_error::JsErrorBox> {
-    let resource = request_resource(state, id)?;
-    let mut pending = resource.request.borrow_mut();
-    let request = pending.as_mut().ok_or_else(|| {
-        deno_error::JsErrorBox::type_error("request was already consumed")
-    })?;
-    Ok(std::mem::take(&mut request.head))
-}
-
-#[op2]
 #[buffer]
 fn op_claviron_application_request_body(
     state: &OpState,
     #[number] id: u64,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
     let resource = request_resource(state, id)?;
-    let request = resource.request.borrow_mut().take().ok_or_else(|| {
+    resource.request_body.borrow_mut().take().ok_or_else(|| {
         deno_error::JsErrorBox::type_error("request body was already consumed")
-    })?;
-    Ok(request.body)
+    })
 }
 
 /// Only a live request body enters this path; its receiver has one owner.
@@ -119,40 +104,41 @@ async fn op_claviron_application_request_read(
 }
 
 /// Static replies cross the bridge once, without a stream channel or pump.
-#[op2(fast)]
+#[op2(fast, reentrant)]
 fn op_claviron_application_response_whole(
-    state: &OpState,
+    scope: &mut v8::PinScope,
+    state: Rc<RefCell<OpState>>,
     #[number] id: u64,
-    #[string] head: String,
+    status: f64,
+    headers: v8::Local<v8::Array>,
     #[buffer(copy)] body: Vec<u8>,
 ) -> Result<bool, deno_error::JsErrorBox> {
-    let resource = request_resource(state, id)?;
-    let head: ResponseHead = serde_json::from_str(&head).map_err(|error| {
-        deno_error::JsErrorBox::type_error(error.to_string())
-    })?;
+    let status = response_status(status)?;
+    let headers = response_headers(scope, headers)?;
+    let resource = request_resource(&state.borrow(), id)?;
     let reply = resource.reply.borrow_mut().take().ok_or_else(|| {
         deno_error::JsErrorBox::type_error("response head was already sent")
     })?;
-    Ok(reply
-        .send(Ok(crate::ApplicationResponse {
-            status: head.status,
-            headers: head.headers,
-            body: crate::ResponseBody::Whole(bytes::Bytes::from(body)),
-        }))
-        .is_ok())
+    let mut response = crate::ApplicationResponse::new(
+        crate::ResponseBody::Whole(bytes::Bytes::from(body)),
+    );
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    Ok(reply.send(Ok(response)).is_ok())
 }
 
 /// The first live response commits its head and creates only its own channel.
-#[op2(fast)]
+#[op2(fast, reentrant)]
 fn op_claviron_application_response_head(
-    state: &OpState,
+    scope: &mut v8::PinScope,
+    state: Rc<RefCell<OpState>>,
     #[number] id: u64,
-    #[string] head: String,
+    status: f64,
+    headers: v8::Local<v8::Array>,
 ) -> Result<bool, deno_error::JsErrorBox> {
-    let resource = request_resource(state, id)?;
-    let head: ResponseHead = serde_json::from_str(&head).map_err(|error| {
-        deno_error::JsErrorBox::type_error(error.to_string())
-    })?;
+    let status = response_status(status)?;
+    let headers = response_headers(scope, headers)?;
+    let resource = request_resource(&state.borrow(), id)?;
     let reply = resource.reply.borrow_mut().take().ok_or_else(|| {
         deno_error::JsErrorBox::type_error("response head was already sent")
     })?;
@@ -160,17 +146,93 @@ fn op_claviron_application_response_head(
     let (completion, finished) = tokio::sync::oneshot::channel();
     *resource.output.borrow_mut() = Some(sender);
     *resource.completion.borrow_mut() = Some(completion);
-    Ok(reply
-        .send(Ok(crate::ApplicationResponse {
-            status: head.status,
-            headers: head.headers,
-            body: crate::ResponseBody::Stream(crate::ResponseStream::new(
-                receiver,
-                finished,
-                resource.lifetime.cancellation.clone(),
-            )),
-        }))
-        .is_ok())
+    let mut response = crate::ApplicationResponse::new(
+        crate::ResponseBody::Stream(crate::ResponseStream::new(
+            receiver,
+            finished,
+            resource.lifetime.cancellation.clone(),
+        )),
+    );
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    Ok(reply.send(Ok(response)).is_ok())
+}
+
+fn response_status(
+    status: f64
+) -> Result<http::StatusCode, deno_error::JsErrorBox> {
+    if !(100.0..1000.0).contains(&status) || status.fract() != 0.0 {
+        return Err(deno_error::JsErrorBox::type_error(
+            "invalid HTTP response status",
+        ));
+    }
+    http::StatusCode::from_u16(status as u16)
+        .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))
+}
+
+/// Decode V8 ByteStrings directly into owned HTTP headers.
+/// Array access can invoke guest getters; hold no OpState/resource borrow here.
+fn response_headers(
+    scope: &mut v8::PinScope,
+    headers: v8::Local<v8::Array>,
+) -> Result<http::HeaderMap, deno_error::JsErrorBox> {
+    fn bytes(
+        scope: &mut v8::PinScope,
+        value: v8::Local<v8::Value>,
+    ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+        let string =
+            v8::Local::<v8::String>::try_from(value).map_err(|_| {
+                deno_error::JsErrorBox::type_error(
+                    "response header must be a string",
+                )
+            })?;
+        if !string.contains_only_onebyte() {
+            return Err(deno_error::JsErrorBox::type_error(
+                "response header must be a ByteString",
+            ));
+        }
+        let mut bytes = vec![0; string.length()];
+        string.write_one_byte_v2(scope, 0, &mut bytes, v8::WriteFlags::empty());
+        Ok(bytes)
+    }
+    let mut result = http::HeaderMap::try_with_capacity(
+        headers.length() as usize
+    )
+    .map_err(|error| deno_error::JsErrorBox::type_error(error.to_string()))?;
+    for index in 0..headers.length() {
+        let pair = headers
+            .get_index(scope, index)
+            .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+            .filter(|pair| pair.length() == 2)
+            .ok_or_else(|| {
+                deno_error::JsErrorBox::type_error(
+                    "response header must be a pair",
+                )
+            })?;
+        let name = pair.get_index(scope, 0).ok_or_else(|| {
+            deno_error::JsErrorBox::type_error(
+                "response header name is unavailable",
+            )
+        })?;
+        let name = http::HeaderName::from_bytes(&bytes(scope, name)?).map_err(
+            |error| deno_error::JsErrorBox::type_error(error.to_string()),
+        )?;
+        let value = pair.get_index(scope, 1).ok_or_else(|| {
+            deno_error::JsErrorBox::type_error(
+                "response header value is unavailable",
+            )
+        })?;
+        let value = http::HeaderValue::from_maybe_shared(bytes::Bytes::from(
+            bytes(scope, value)?,
+        ))
+        .map_err(|error| {
+            deno_error::JsErrorBox::type_error(error.to_string())
+        })?;
+        result.try_append(name, value).map_err(|error| {
+            deno_error::JsErrorBox::type_error(error.to_string())
+        })?;
+    }
+    Ok(result)
 }
 
 #[op2]
@@ -241,7 +303,6 @@ deno_core::extension!(
         op_claviron_cancelled,
         op_claviron_environment,
         op_claviron_runtime_yield,
-        op_claviron_application_request,
         op_claviron_application_request_body,
         op_claviron_application_request_read,
         op_claviron_application_response_whole,

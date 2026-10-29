@@ -7,7 +7,8 @@ Deno CLI/runtime environment.
 ## Boundaries
 
 - `application/` is the backend-independent application contract and request /
-  response message model.
+  response body model. Request and response aliases use the standard `http`
+  crate, without selecting Claviron's server or Edge features.
 - `engine/` owns the slim `deno_core::JsRuntime`, local ESM loading,
   TypeScript transpilation and its Web platform composition. The slim runtime
   registers the compatible `deno_webidl`, `deno_web` and `deno_crypto`
@@ -72,7 +73,16 @@ asynchronous wait does not reserve an instance. Synchronous JS remains serial.
 The per-instance one-request semaphore is removed.
 
 The bridge converts Claviron HTTP requests to Web `Request` values and Web
-`Response` values back to Claviron responses. Each call owns a native request
+`Response` values back to Claviron responses. HTTP request/response parts and
+their `HeaderMap` move through the mailbox and adapter directly. The owner
+passes method, absolute URI, header pairs and body flags as V8 function
+arguments. Replies supply a numeric status and header arrays to native ops;
+neither direction encodes or parses a JSON head. HTTP header values preserve
+Fetch ByteString (Latin-1) bytes, including repeated fields. V8 strings and Rust
+owned response headers are allocated at the isolate boundary; bodies retain
+their existing byte/stream ownership. Header array access permits guest getters
+without retaining an OpState or request-resource borrow across guest execution.
+Each call owns a native request
 resource handle containing its request, reply, body endpoints, cancellation and
 admission lifetime. No singleton request/reply slots remain in `OpState`.
 Handles are exact JavaScript-safe 53-bit integers, never recycled or wrapped.
@@ -99,7 +109,8 @@ containers and connection clients may be created once and reused.
 
 The HTTP adapter constructs the absolute Web Request URL from accepted
 transport scheme and request authority, preserving port, path and query.
-The original Rust URI is not rewritten. Connection facts override any
+The application-facing request carries that absolute URI with its original
+path and query. Connection facts override any
 absolute-URI scheme or client forwarding header. A direct caller without
 transport context must provide a typed HTTP(S) scheme plus authority, or an
 absolute HTTP(S) URI; missing information is an error, never invented

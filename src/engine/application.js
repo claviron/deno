@@ -7,14 +7,13 @@
     const takeResponseBody = globalThis[Symbol.for("claviron.response.body")];
     const requests = new Map();
 
-    async function dispatch(id) {
-        const raw = JSON.parse(runtime.takeApplicationRequest(id));
+    async function dispatch(id, method, url, headers, streamed, hasBody) {
         const abort = new AbortController();
         const context = { abort, reader: null };
         requests.set(id, context);
         try {
             let body;
-            if (raw.streamed) {
+            if (streamed) {
                 body = new ReadableStream({
                     async pull(controller) {
                         try {
@@ -26,12 +25,12 @@
                         }
                     },
                 });
-            } else if (raw.has_body) {
+            } else if (hasBody) {
                 body = runtime.takeApplicationRequestBody(id);
             }
-            const request = new Request(raw.url, {
-                method: raw.method,
-                headers: raw.headers,
+            const request = new Request(url, {
+                method,
+                headers,
                 body,
                 duplex: "half",
                 signal: abort.signal,
@@ -40,13 +39,13 @@
             if (!(response instanceof Response)) {
                 throw new TypeError("JavaScript application fetch handler must return a Response");
             }
-            const head = JSON.stringify({ status: response.status, headers: Array.from(response.headers) });
+            const responseHeaders = Array.from(response.headers);
             const source = takeResponseBody(response);
             if (!(source instanceof ReadableStream)) {
-                runtime.respondWhole(id, head, source);
+                runtime.respondWhole(id, response.status, responseHeaders, source);
                 return;
             }
-            if (!runtime.respondHead(id, head)) {
+            if (!runtime.respondHead(id, response.status, responseHeaders)) {
                 await source.cancel();
                 return;
             }

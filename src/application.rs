@@ -4,11 +4,9 @@ mod request;
 mod runtime;
 
 pub use definition::ApplicationDefinition;
+pub(crate) use message::RESPONSE_BODY_CAPACITY;
 pub use message::{
     ApplicationRequest, ApplicationResponse, ReplySender, RequestBody,
-};
-pub(crate) use message::{
-    PendingRequest, RESPONSE_BODY_CAPACITY, RequestHead, ResponseHead,
 };
 #[cfg(feature = "websocket")]
 pub(crate) use message::{

@@ -62,7 +62,7 @@ impl JsApplicationAdapter {
         &self,
         request: Request<RouteBody>,
     ) -> crate::Result<RouteResponse> {
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
         let policy = parts
             .extensions
             .get::<HttpPolicy>()
@@ -102,67 +102,35 @@ impl JsApplicationAdapter {
                 crate::RequestBody::Stream(pump_request_body(body))
             }
         };
-        let url = application_url(&parts)?;
-        let request = ApplicationRequest {
-            method: parts.method.to_string(),
-            url,
-            headers: parts
-                .headers
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_owned(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect(),
-            body,
-        };
+        parts.uri = application_uri(&parts)?;
+        let request = ApplicationRequest::from_parts(parts, body);
         let response = self
             .service
             .execute(&self.application, request, policy.requests.queue_timeout)
             .await?;
-        let status =
-            StatusCode::from_u16(response.status).map_err(|error| {
-                crate::Error::ApplicationUnavailable(error.to_string())
-            })?;
-        let mut headers =
-            http::HeaderMap::with_capacity(response.headers.len());
-        for (name, value) in response.headers {
-            let name = http::HeaderName::try_from(name).map_err(|error| {
-                crate::Error::ApplicationUnavailable(error.to_string())
-            })?;
-            let value =
-                http::HeaderValue::try_from(value).map_err(|error| {
-                    crate::Error::ApplicationUnavailable(error.to_string())
-                })?;
-            headers.append(name, value);
-        }
-        let body = match response.body {
+        let (mut parts, body) = response.into_parts();
+        let body = match body {
             crate::ResponseBody::Whole(bytes) => {
-                headers.remove(claviron::http::policy::X_ACCEL_BUFFERING);
+                parts.headers.remove(claviron::http::policy::X_ACCEL_BUFFERING);
                 claviron::http::bytes_body(bytes)
             }
             crate::ResponseBody::Stream(stream) => {
                 claviron::http::body::deliver_reply(
-                    &mut headers,
+                    &mut parts.headers,
                     boxed_body(ReplyBody(stream)),
                     &policy.responses,
                 )
                 .await
             }
         };
-        let mut reply = Response::new(body);
-        *reply.status_mut() = status;
-        *reply.headers_mut() = headers;
-        Ok(reply)
+        Ok(Response::from_parts(parts, body))
     }
 }
 
-/// Fetch needs an absolute URL; the Rust request keeps its original URI.
-pub(super) fn application_url(
+/// Resolve Fetch's absolute URI while preserving the accepted path and query.
+pub(super) fn application_uri(
     parts: &http::request::Parts
-) -> crate::Result<String> {
+) -> crate::Result<http::Uri> {
     use http::uri::{Authority, Scheme};
 
     let scheme = request_scheme(&parts.extensions)
@@ -197,13 +165,16 @@ pub(super) fn application_url(
                 "request has no valid authority".into(),
             )
         })?;
-    let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
+    let path = parts
+        .uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
     http::Uri::builder()
         .scheme(scheme)
         .authority(authority)
         .path_and_query(path)
         .build()
-        .map(|uri| uri.to_string())
         .map_err(|error| Error::ApplicationUnavailable(error.to_string()))
 }
 

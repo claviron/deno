@@ -1,14 +1,9 @@
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "websocket")]
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-/// Framework-neutral request delivered to one persistent JavaScript application.
-#[derive(Debug)]
-pub struct ApplicationRequest {
-    pub method: String,
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-    pub body: RequestBody,
-}
+/// Standard HTTP request moved to the persistent JavaScript application.
+pub type ApplicationRequest = http::Request<RequestBody>;
 
 /// A request's body as it reaches the isolate: whole, or piece by piece as it
 /// arrives, which the handler reads as the `Request`'s `ReadableStream`. The
@@ -22,16 +17,8 @@ pub enum RequestBody {
     Stream(mpsc::Receiver<Result<bytes::Bytes, String>>),
 }
 
-/// Framework-neutral response returned by a JavaScript Fetch handler: its
-/// head and either complete bytes or a live body. Static replies need no channel;
-/// a live reply's head is handed over before its body finishes. The shared HTTP
-/// policy decides whether live pieces are buffered before reaching the client.
-#[derive(Debug)]
-pub struct ApplicationResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: super::ResponseBody,
-}
+/// Standard HTTP response with either complete bytes or a live body.
+pub type ApplicationResponse = http::Response<super::ResponseBody>;
 
 /// Where the head goes when the handler answers, and an error when it never
 /// does.
@@ -42,33 +29,6 @@ pub type ReplySender =
 /// purpose, as SAPI's: a client that stops reading is felt by the handler at
 /// once, as a `writeBody` that waits.
 pub(crate) const RESPONSE_BODY_CAPACITY: usize = 2;
-
-/// The request waiting for its isolate: the head as JSON, the body as
-/// bytes. Two parts because a body crosses into V8 as a `Uint8Array`; as JSON
-/// every byte became a number and a comma, and a 24 KB page roughly 90 KB of
-/// text to write and parse.
-pub(crate) struct PendingRequest {
-    pub head: String,
-    pub body: Vec<u8>,
-}
-
-/// What crosses as JSON of a request: everything but the body, and whether
-/// the body comes whole or as a stream.
-#[derive(Serialize)]
-pub(crate) struct RequestHead<'a> {
-    pub method: &'a str,
-    pub url: &'a str,
-    pub headers: &'a [(String, String)],
-    pub streamed: bool,
-    pub has_body: bool,
-}
-
-/// What crosses as JSON of a reply: everything but the body.
-#[derive(Deserialize)]
-pub(crate) struct ResponseHead {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-}
 
 #[cfg(feature = "websocket")]
 #[derive(Debug, Serialize)]
