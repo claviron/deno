@@ -223,8 +223,10 @@ impl JsApplicationService {
     }
 
     /// Run one request on `name`. `queue_timeout` is its route's
-    /// `requests.queue_timeout`: the wait for an isolate (unset waits, zero
-    /// rejects at once).
+    /// `requests.queue_timeout`: a positive duration bounds the wait for owner
+    /// acknowledgement; unset has no deadline. Zero enqueues without waiting
+    /// for acknowledgement, subject to application admission and owner
+    /// availability. With both timeouts unset, dispatch waits only for a reply.
     pub async fn execute(
         &self,
         name: &str,

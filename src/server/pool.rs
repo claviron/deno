@@ -30,13 +30,7 @@ use crate::{
 use super::mailbox;
 
 enum WorkerCommand {
-    Execute {
-        request: ApplicationRequest,
-        started: oneshot::Sender<()>,
-        reply:
-            oneshot::Sender<std::result::Result<ApplicationResponse, String>>,
-        lifetime: RequestLifetime,
-    },
+    Execute(ExecuteRequest),
     #[cfg(feature = "orbit")]
     ApplicationEvent {
         event: ApplicationEvent,
@@ -59,6 +53,32 @@ enum WorkerCommand {
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     Shutdown,
+}
+
+struct ExecuteRequest {
+    request: ApplicationRequest,
+    started: Option<oneshot::Sender<()>>,
+    reply: crate::application::ReplySender,
+    lifetime: RequestLifetime,
+}
+
+impl ExecuteRequest {
+    fn start(
+        self,
+        execute: impl FnOnce(
+            ApplicationRequest,
+            crate::application::ReplySender,
+            RequestLifetime,
+        ) -> Result<()>,
+    ) -> Result<()> {
+        if self.lifetime.cancellation.is_cancelled() {
+            return Ok(());
+        }
+        if let Some(started) = self.started {
+            let _ = started.send(());
+        }
+        execute(self.request, self.reply, self.lifetime)
+    }
 }
 
 struct ApplicationWorker {
@@ -397,18 +417,26 @@ impl ApplicationPool {
         })?;
         let worker = worker.as_ref();
         let immediate = queue_timeout.is_some_and(|timeout| timeout.is_zero());
+        let execution_timeout = self.limits.execution_timeout();
+        let needs_acceptance = !immediate
+            && (queue_timeout.is_some() || execution_timeout.is_some());
         let deadline =
             queue_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let expired =
             || Error::DispatchQueueTimedOut(queue_timeout.unwrap_or_default());
-        let (started, accepted) = oneshot::channel();
+        let (started, accepted) = if needs_acceptance {
+            let (started, accepted) = oneshot::channel();
+            (Some(started), Some(accepted))
+        } else {
+            (None, None)
+        };
         let (reply, response) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let mut guard = RequestGuard(Some(cancellation.clone()));
         worker.counters.active.fetch_add(1, Ordering::Relaxed);
         worker
             .sender
-            .send_admitted(WorkerCommand::Execute {
+            .send_admitted(WorkerCommand::Execute(ExecuteRequest {
                 request,
                 started,
                 reply,
@@ -417,9 +445,9 @@ impl ApplicationPool {
                     _admission: Some(admission),
                     counters: Some(Arc::clone(&worker.counters)),
                 },
-            })
+            }))
             .map_err(|_| Error::RequestChannelClosed)?;
-        if !immediate {
+        if let Some(accepted) = accepted {
             match within(deadline, accepted).await {
                 Some(Ok(())) => {}
                 Some(Err(_)) => return Err(Error::RequestChannelClosed),
@@ -428,7 +456,7 @@ impl ApplicationPool {
                 }
             }
         }
-        let result = match self.limits.execution_timeout() {
+        let result = match execution_timeout {
             Some(timeout) => {
                 match tokio::time::timeout(timeout, response).await {
                     Ok(result) => result,
@@ -702,14 +730,10 @@ async fn handle_command(
     graceful_timeout: Option<Duration>,
 ) -> bool {
     match command {
-        WorkerCommand::Execute { request, started, reply, lifetime } => {
-            if lifetime.cancellation.is_cancelled() {
-                return true;
-            }
-            let _ = started.send(());
-            if let Err(error) =
+        WorkerCommand::Execute(request) => {
+            if let Err(error) = request.start(|request, reply, lifetime| {
                 application.start_request(request, reply, lifetime)
-            {
+            }) {
                 tracing::debug!(%error, "JavaScript application request could not start");
             }
         }
@@ -850,6 +874,10 @@ async fn sleep_until(deadline: Option<Instant>) {
 #[cfg(test)]
 #[path = "../../tests/server/pool.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/server/dispatch.rs"]
+mod dispatch_tests;
 
 /// `future` until `deadline`, or as long as it takes when there is none.
 async fn within<F: std::future::Future>(

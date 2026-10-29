@@ -303,6 +303,16 @@ actual guest completion. `requests.queue_timeout` bounds the wait for the
 isolate owner's acknowledgement, including time queued behind earlier commands.
 A zero `requests.queue_timeout` enqueues immediately without waiting for the
 owner acknowledgement; HTTP has no separate mailbox-capacity rejection.
+When both queue and execution timeouts are unset, HTTP allocates no acceptance
+oneshot and waits only for its response. A positive queue timeout, or an
+execution timeout with an unset queue timeout, retains owner acknowledgement.
+This keeps execution's deadline after acceptance. A zero queue timeout also
+needs no acknowledgement; its execution budget begins after enqueue as before.
+The shared application admission bound intentionally includes cancelled queued
+commands until their owner consumes or drops them. A slow isolate's backlog
+can therefore exhaust admission for healthy siblings; round-robin does not
+reserve a separate budget per isolate. Cancelled commands are skipped before
+guest entry, releasing their owned permit and active counter exactly once.
 `execution_timeout` bounds acceptance to the response head and cancels
 only that request cooperatively; `null` leaves it unbounded. It never invokes
 V8's isolate-wide `terminate_execution` for an individual request. A synchronous
