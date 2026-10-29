@@ -113,5 +113,5 @@ deno_core::extension!(
 );
 
 pub(crate) fn extension() -> Extension {
-    claviron_websocket_extension::init()
+    crate::engine::embedded::extension(claviron_websocket_extension::init())
 }

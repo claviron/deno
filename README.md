@@ -8,6 +8,10 @@ request dispatch and application lifecycle.
 Select this crate alongside Claviron in your application. Claviron does not
 select or embed the JavaScript engine automatically.
 
+Built-in Claviron and Deno platform JavaScript modules are embedded in the host
+binary. Deployment does not require this source checkout or Cargo registry
+sources. Application modules load from the paths you configure.
+
 ## Application modules
 
 An application exports a function, or an object with a `fetch` method:

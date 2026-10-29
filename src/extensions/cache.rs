@@ -365,7 +365,9 @@ impl ExtensionFactory for CacheExtension {
         &self,
         _context: ExtensionContext,
     ) -> Extension {
-        claviron_cache_extension::init(CacheContext::new(self.provider.clone()))
+        crate::engine::embedded::extension(claviron_cache_extension::init(
+            CacheContext::new(self.provider.clone()),
+        ))
     }
 
     fn modules(&self) -> &'static [ExtensionModule] {

@@ -152,10 +152,12 @@ impl ExtensionFactory for LogExtension {
         &self,
         context: ExtensionContext,
     ) -> Extension {
-        claviron_log_extension::init(LogContext {
-            channels: self.channels.clone(),
-            target: Arc::from(context.application_name()),
-        })
+        crate::engine::embedded::extension(claviron_log_extension::init(
+            LogContext {
+                channels: self.channels.clone(),
+                target: Arc::from(context.application_name()),
+            },
+        ))
     }
 
     fn modules(&self) -> &'static [ExtensionModule] {

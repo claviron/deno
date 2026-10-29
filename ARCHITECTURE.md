@@ -51,6 +51,18 @@ The JavaScript-facing extension namespace is `claviron:*`. Application code
 must not call `Deno.core.ops` directly. The slim engine maps those public
 specifier names to private `ext:` modules.
 
+Built-in extension sources are embedded at compile time. The build script and
+runtime share `engine/builtin.rs` for the ordered Deno platform extension set.
+The build collects those extensions' source files and this crate's runtime JS
+files into a generated `ascii_str_include!` table. `engine/embedded.rs` binds
+eager and lazy source descriptors to those static bytes before an isolate is
+created; it never reads a source file or falls back to disk at runtime. Native
+ops, state initialization and module specifiers retain their existing order.
+Claviron extension factories also bind their built-in sources when used through
+the standalone backend seam. Third-party factories own their source packaging;
+they should supply in-memory `ExtensionFileSource` values. Application modules
+and their imports remain application-owned files loaded by the module loader.
+
 Embedded `js:` tasks use the executor-independent `tasks.yaml` `log:` policy.
 `console.log` writes stdout and warning/error levels write stderr; relative
 file targets resolve against the task `cwd`. The sink travels in that task

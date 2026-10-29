@@ -532,9 +532,9 @@ impl ExtensionFactory for DatabaseExtension {
         &self,
         _context: ExtensionContext,
     ) -> Extension {
-        claviron_database_extension::init(DatabaseContext::new(Arc::clone(
-            &self.service,
-        )))
+        crate::engine::embedded::extension(claviron_database_extension::init(
+            DatabaseContext::new(Arc::clone(&self.service)),
+        ))
     }
 
     fn modules(&self) -> &'static [ExtensionModule] {

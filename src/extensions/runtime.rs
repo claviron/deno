@@ -418,5 +418,7 @@ deno_core::extension!(
 );
 
 pub(crate) fn extension(context: ExtensionContext) -> Extension {
-    claviron_runtime_extension::init(context)
+    crate::engine::embedded::extension(claviron_runtime_extension::init(
+        context,
+    ))
 }

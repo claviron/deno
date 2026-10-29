@@ -932,21 +932,23 @@ impl ExtensionFactory for OrbitExtension {
                     .target()
                     .is_none_or(|application| application == &target)
             });
-        claviron_orbit_extension::init(OrbitContext {
-            application,
-            counter_provider: Arc::clone(&self.counter_provider),
-            event_waiters: Arc::new(Mutex::new(HashMap::new())),
-            inbox: Arc::new(tokio::sync::Mutex::new(inbox)),
-            subscriptions,
-            events: self.events.clone(),
-            next_event_waiter: Arc::new(AtomicU32::new(1)),
-            fleet_provider: Arc::clone(&self.fleet_provider),
-            lock: Arc::new(Mutex::new(None)),
-            cells_provider: self.cells_provider.clone(),
-            invocation_provider: self.invocation_provider.clone(),
-            invocation_inbox: Arc::new(InvocationInbox::new()),
-            cell_waits: Arc::default(),
-        })
+        crate::engine::embedded::extension(claviron_orbit_extension::init(
+            OrbitContext {
+                application,
+                counter_provider: Arc::clone(&self.counter_provider),
+                event_waiters: Arc::new(Mutex::new(HashMap::new())),
+                inbox: Arc::new(tokio::sync::Mutex::new(inbox)),
+                subscriptions,
+                events: self.events.clone(),
+                next_event_waiter: Arc::new(AtomicU32::new(1)),
+                fleet_provider: Arc::clone(&self.fleet_provider),
+                lock: Arc::new(Mutex::new(None)),
+                cells_provider: self.cells_provider.clone(),
+                invocation_provider: self.invocation_provider.clone(),
+                invocation_inbox: Arc::new(InvocationInbox::new()),
+                cell_waits: Arc::default(),
+            },
+        ))
     }
 
     fn modules(&self) -> &'static [ExtensionModule] {

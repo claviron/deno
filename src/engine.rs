@@ -1,4 +1,6 @@
+mod builtin;
 mod core;
+pub(crate) mod embedded;
 mod loader;
 mod platform;
 pub(crate) mod request_data;

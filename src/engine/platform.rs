@@ -62,34 +62,24 @@ pub(crate) fn runtime_extensions(
             Arc::new(StaticRootCertStore(store))
                 as Arc<dyn deno_tls::RootCertStoreProvider>
         });
-    let mut extensions = vec![
-        #[cfg(feature = "fetch")]
-        deno_telemetry::deno_telemetry::init(),
-        deno_webidl::deno_webidl::init(),
-        deno_web::deno_web::init(
-            deno_web::BlobStore::default_arc(),
-            None,
-            Default::default(),
-            Default::default(),
-        ),
-        deno_crypto::deno_crypto::init(None),
-    ];
     #[cfg(feature = "fetch")]
-    extensions.push(deno_fetch::deno_fetch::init(deno_fetch::Options {
+    let mut extensions = super::builtin::extensions(deno_fetch::Options {
         user_agent: context.fetch_user_agent().to_owned(),
         root_cert_store_provider,
         ..Default::default()
-    }));
-    #[cfg(feature = "fetch")]
-    extensions.push(deno_net::deno_net::init(None, None));
-    #[cfg(feature = "fetch")]
-    extensions.push(deno_tls::deno_tls::init());
+    });
+    #[cfg(not(feature = "fetch"))]
+    let mut extensions = super::builtin::extensions();
     extensions.push(claviron_web_platform::init());
     #[cfg(feature = "fetch")]
     extensions.push(claviron_fetch_platform::init());
     #[cfg(feature = "websocket")]
     extensions.push(crate::extensions::websocket::extension());
     extensions.extend(deno::extensions(context.clone()));
+    let mut extensions = extensions
+        .into_iter()
+        .map(super::embedded::extension)
+        .collect::<Vec<_>>();
     extensions.extend(
         factories.iter().map(|factory| factory.extension(context.clone())),
     );
