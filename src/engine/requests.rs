@@ -9,6 +9,7 @@ use deno_core::v8;
 
 use super::CoreEngine;
 use crate::application::{RequestLifetime, RequestResource, RequestResources};
+use crate::engine::request_data::RequestData;
 use crate::{ApplicationRequest, Error, RequestBody, Result};
 
 type Call = LocalBoxFuture<
@@ -68,7 +69,7 @@ impl CoreEngine {
             }
             RequestBody::Stream(input) => (Vec::new(), Some(input), true),
         };
-        let streamed = input.is_some();
+        let body_kind = if input.is_some() { 2 } else { u32::from(has_body) };
         let cancellation = lifetime.cancellation.clone();
         let id = self
             .runtime
@@ -76,7 +77,6 @@ impl CoreEngine {
             .borrow_mut()
             .borrow_mut::<RequestResources>()
             .insert(RequestResource {
-                request_body: RefCell::new(Some(body)),
                 has_input: input.is_some(),
                 input: RefCell::new(input),
                 reply: RefCell::new(Some(reply)),
@@ -86,62 +86,16 @@ impl CoreEngine {
                 closed: Cell::new(false),
             })
             .map_err(|error| Error::ApplicationUnavailable(error.into()))?;
-        let arguments: Result<[v8::Global<v8::Value>; 6]> = (|| {
+        let arguments = {
             deno_core::scope!(scope, self.runtime);
-            let string = |value: &str| {
-                v8::String::new(scope, value).ok_or_else(|| {
-                    Error::ApplicationUnavailable(
-                        "request string exceeds V8 limits".into(),
-                    )
-                })
-            };
-            let method = string(parts.method.as_str())?;
-            let url = string(&parts.uri.to_string())?;
-            let mut headers = Vec::with_capacity(parts.headers.len());
-            for (name, value) in &parts.headers {
-                let name = string(name.as_str())?;
-                // HTTP field values and Fetch ByteStrings use Latin-1, not UTF-8.
-                let value = v8::String::new_from_one_byte(
-                    scope,
-                    value.as_bytes(),
-                    v8::NewStringType::Normal,
-                )
-                .ok_or_else(|| {
-                    Error::ApplicationUnavailable(
-                        "request header exceeds V8 limits".into(),
-                    )
-                })?;
-                let pair = v8::Array::new_with_elements(
-                    scope,
-                    &[name.into(), value.into()],
-                );
-                headers.push(pair.into());
-            }
-            let headers = v8::Array::new_with_elements(scope, &headers);
-            let arguments: [v8::Local<v8::Value>; 6] = [
+            // Metadata stays in Rust until a Web Request getter needs it.
+            let data = RequestData::new(parts, body).into_v8(scope);
+            let arguments: [v8::Local<v8::Value>; 3] = [
                 v8::Number::new(scope, id as f64).into(),
-                method.into(),
-                url.into(),
-                headers.into(),
-                v8::Boolean::new(scope, streamed).into(),
-                v8::Boolean::new(scope, has_body).into(),
+                v8::Integer::new_from_unsigned(scope, body_kind).into(),
+                data.into(),
             ];
-            Ok(arguments.map(|value| v8::Global::new(scope, value)))
-        })();
-        let arguments = match arguments {
-            Ok(arguments) => arguments,
-            Err(error) => {
-                if let Some(resource) = self
-                    .runtime
-                    .op_state()
-                    .borrow_mut()
-                    .borrow_mut::<RequestResources>()
-                    .take(id)
-                {
-                    resource.finish(Err(error.to_string()));
-                }
-                return Err(error);
-            }
+            arguments.map(|value| v8::Global::new(scope, value))
         };
         let call =
             self.runtime.call_with_args(function, &arguments).boxed_local();

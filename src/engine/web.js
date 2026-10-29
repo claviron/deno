@@ -146,7 +146,42 @@
     }
 
     Object.assign(globalThis, { Headers, Request, Response });
-    Object.defineProperty(globalThis, Symbol.for("claviron.response.body"), {
-        value: (response) => response._takeBody(),
+    Object.defineProperty(globalThis, Symbol.for("claviron.http"), {
+        value(runtime) {
+            const controllers = new WeakMap();
+            return {
+                createRequest(id, bodyKind, data) {
+                    const abort = new AbortController();
+                    const body = bodyKind === 2 ? new ReadableStream({
+                        async pull(controller) {
+                            try {
+                                const chunk = await runtime.readRequestBody(id);
+                                if (chunk.length === 0) controller.close();
+                                else controller.enqueue(chunk);
+                            } catch (error) { controller.error(error); }
+                        },
+                    }) : bodyKind === 1 ? runtime.takeApplicationRequestBody(data) : undefined;
+                    const request = new Request(runtime.requestUrl(data), {
+                        method: runtime.requestMethod(data), headers: runtime.requestHeaders(data),
+                        body, signal: abort.signal,
+                    });
+                    controllers.set(request, abort);
+                    return request;
+                },
+                abortRequest(request) {
+                    controllers.get(request).abort(new DOMException("Request cancelled", "AbortError"));
+                },
+                respond(id, response) {
+                    const headers = Array.from(response.headers);
+                    const body = response._takeBody();
+                    if (!(body instanceof ReadableStream)) {
+                        runtime.respondWhole(id, response.status, headers, body);
+                        return null;
+                    }
+                    if (!runtime.respondHead(id, response.status, headers)) return body.cancel();
+                    return body;
+                },
+            };
+        },
     });
 })();

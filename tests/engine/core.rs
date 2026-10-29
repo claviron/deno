@@ -181,13 +181,6 @@ async fn typed_http_metadata_survives_without_json_for_whole_and_streamed_replie
                 ["x-byte", "caf\u00e9"], ["x-repeat", "one"], ["x-repeat", "two"],
                 ["set-cookie", "a=1"], ["set-cookie", "b=2"]
             ]});
-            const entries = Array.from(response.headers);
-            const name = entries[0][0];
-            Object.defineProperty(entries[0], 0, {get() {
-                if (!globalThis[Symbol.for("claviron.runtime")].runtimeAvailable()) throw new Error("reentry failed");
-                return name;
-            }});
-            response.headers[Symbol.iterator] = () => entries.values();
             return response;
         }
     "#).unwrap();
@@ -213,7 +206,16 @@ async fn typed_http_metadata_survives_without_json_for_whole_and_streamed_replie
                 let mut response = replied.await.unwrap().unwrap();
                 assert_eq!(response.status(), 207);
                 assert_eq!(response.headers()["x-byte"].as_bytes(), b"caf\xe9");
-                assert_eq!(response.headers()["x-repeat"], "one, two");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get_all("x-repeat")
+                        .iter()
+                        .map(|value| value.to_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    "one, two"
+                );
                 #[cfg(feature = "fetch")]
                 assert_eq!(
                     response
@@ -308,6 +310,204 @@ async fn streams_a_request_body_and_fails_a_cut_one() {
             assert_eq!(status, 200);
             assert_eq!(received, b"one two three");
         }
+    }
+}
+
+#[cfg(feature = "fetch")]
+#[tokio::test(flavor = "current_thread")]
+async fn lazy_fetch_requests_keep_clone_bodies_and_exposed_headers() {
+    let directory = tempdir().unwrap();
+    let main_module = directory.path().join("application.js");
+    fs::write(&main_module, r#"
+        let calls = 0, ignored, retained;
+        export default async function(request) {
+            if (!(request instanceof Request)) throw new Error("not a Fetch Request");
+            if (calls++ === 0) {
+                ignored = request;
+                return new Response("ignored");
+            }
+            if (retained && (retained.get("X-Repeat") !== "one, two" ||
+                Array.from(retained).length !== 2)) throw new Error("retained headers lost");
+            if (ignored) {
+                if (ignored.url !== "http://example.test/echo?q=1" || ignored.method !== "POST" ||
+                    ignored.headers.get("x-repeat") !== "one, two" || ignored.bodyUsed) {
+                    throw new Error("retained request lost its values");
+                }
+                if ((await ignored.bytes()).join() !== "0,128,255" || !ignored.bodyUsed) {
+                    throw new Error("retained request lost its buffered body");
+                }
+                if (ignored.signal.aborted) throw new Error("successful request was aborted");
+                ignored = null;
+            }
+            retained = request.headers;
+            if (retained.get("X-Repeat") !== "one, two" || retained.get("missing") !== null ||
+                retained.get("content-type") !== "application/octet-stream") throw new Error("lazy headers changed");
+            const cloned = request.clone();
+            cloned.headers.set("x-repeat", "clone");
+            if (request.headers.get("x-repeat") !== "one, two") throw new Error("clone shares headers");
+            if (request.method !== "POST" || request.url !== "http://example.test/echo?q=1" ||
+                cloned.url !== request.url || cloned.signal.aborted || request.bodyUsed) throw new Error("request changed");
+            const [one, two] = await Promise.all([request.bytes(), cloned.bytes()]);
+            if (!request.bodyUsed || !cloned.bodyUsed || one.join() !== "0,128,255" ||
+                two.join() !== one.join()) throw new Error("clone body changed");
+            let used = false;
+            try { await request.text(); } catch { used = true; }
+            if (!used) throw new Error("body consumed twice");
+            return new Response(one);
+        }
+    "#).unwrap();
+    let mut engine =
+        CoreEngine::with_context(ExtensionContext::new("lazy"), &[]).unwrap();
+    engine.boot(&main_module).await.unwrap();
+    for index in 0..3 {
+        if index > 0 {
+            // Retained Request values must root their native data across GC.
+            engine.runtime.v8_isolate().low_memory_notification();
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(bytes::Bytes::from_static(&[0, 128, 255])))
+            .await
+            .unwrap();
+        drop(sender);
+        let body = if index < 2 {
+            crate::RequestBody::Whole(vec![0, 128, 255])
+        } else {
+            crate::RequestBody::Stream(receiver)
+        };
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://example.test/echo?q=1")
+            .header("content-type", "application/octet-stream")
+            .header("x-repeat", "one")
+            .header("x-repeat", "two")
+            .body(body)
+            .unwrap();
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        engine.handle(request, reply).await.unwrap();
+        let response = replied.await.unwrap().unwrap();
+        let crate::ResponseBody::Whole(body) = response.into_body() else {
+            panic!("expected whole response")
+        };
+        assert_eq!(
+            body.as_ref(),
+            if index == 0 { b"ignored".as_slice() } else { &[0, 128, 255] }
+        );
+    }
+}
+
+#[cfg(feature = "fetch")]
+#[tokio::test(flavor = "current_thread")]
+async fn ready_fetch_responses_keep_wire_headers_and_owned_body_bytes() {
+    let directory = tempdir().unwrap();
+    let main_module = directory.path().join("application.js");
+    fs::write(&main_module, r#"
+        let calls = 0, previous, mutable;
+        export default function() {
+            if (previous) {
+                if (!previous.bodyUsed) throw new Error("body was not consumed");
+                let used = false;
+                try { previous.clone(); } catch { used = true; }
+                if (!used) throw new Error("sent response cloned");
+            }
+            if (mutable) mutable.fill(7);
+            let response;
+            switch (calls++) {
+                case 0: response = new Response("caf\u00e9 \ud800"); break;
+                case 1: response = Response.json({ ok: true }); break;
+                case 2:
+                    mutable = new Uint8Array([42, 0, 128, 255, 42]);
+                    response = new Response(mutable.subarray(1, 4)); break;
+                case 3:
+                    response = new Response("changed", { status: 201, headers: [
+                        ["x-repeat", "one"], ["x-repeat", "two"],
+                        ["set-cookie", "a=1"], ["set-cookie", "b=2"]
+                    ]});
+                    response.headers.set("content-type", "application/example"); break;
+                case 4:
+                    response = new Response("mutated");
+                    response.headers.set("content-type", "application/changed"); break;
+                case 5: previous = null; return new Response(null, { status: 204 });
+                case 6:
+                    response = new Response("locked");
+                    response.body.getReader(); return response;
+                case 7:
+                    response = new Response("consumed");
+                    return response.text().then(() => response);
+                default: throw new Error("unexpected request");
+            }
+            previous = response;
+            Object.defineProperty(response, "headers", { get() { throw new Error("public headers used"); } });
+            return response;
+        }
+        // The bridge must pass static text directly, including lone-surrogate
+        // replacement, rather than allocating another JS byte buffer.
+        TextEncoder.prototype.encode = () => { throw new Error("TextEncoder used by bridge"); };
+    "#).unwrap();
+    let mut engine =
+        CoreEngine::with_context(ExtensionContext::new("ready"), &[]).unwrap();
+    engine.boot(&main_module).await.unwrap();
+    let mut bodies = Vec::new();
+    for index in 0..6 {
+        let request = http::Request::builder()
+            .uri("http://example.test/")
+            .body(crate::RequestBody::Empty)
+            .unwrap();
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        engine.handle(request, reply).await.unwrap();
+        let response = replied.await.unwrap().unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            match index {
+                3 => 201,
+                5 => 204,
+                _ => 200,
+            }
+        );
+        let expected_type = match index {
+            0 => Some("text/plain;charset=UTF-8"),
+            1 => Some("application/json"),
+            3 => Some("application/example"),
+            4 => Some("application/changed"),
+            _ => None,
+        };
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .map(|value| value.to_str().unwrap()),
+            expected_type
+        );
+        if index == 3 {
+            assert_eq!(
+                response.headers().get_all("x-repeat").iter().count(),
+                2
+            );
+            assert_eq!(
+                response.headers().get_all("set-cookie").iter().count(),
+                2
+            );
+        }
+        let crate::ResponseBody::Whole(body) = response.into_body() else {
+            panic!("expected whole response")
+        };
+        bodies.push(body);
+    }
+    assert_eq!(bodies[0].as_ref(), "café \u{fffd}".as_bytes());
+    assert_eq!(bodies[1].as_ref(), br#"{"ok":true}"#);
+    assert_eq!(bodies[2].as_ref(), &[0, 128, 255]);
+    assert_eq!(bodies[3].as_ref(), b"changed");
+    assert_eq!(bodies[4].as_ref(), b"mutated");
+    assert!(bodies[5].is_empty());
+    for _ in 0..2 {
+        let request = http::Request::builder()
+            .uri("http://example.test/")
+            .body(crate::RequestBody::Empty)
+            .unwrap();
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        let error = engine.handle(request, reply).await.unwrap_err();
+        assert!(error.to_string().contains("Response body is already used"));
+        assert!(replied.await.unwrap().is_err());
     }
 }
 

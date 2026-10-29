@@ -7,6 +7,10 @@ const {
     op_claviron_cancelled,
     op_claviron_environment,
     op_claviron_runtime_yield,
+    op_claviron_application_request_method,
+    op_claviron_application_request_url,
+    op_claviron_application_request_headers,
+    op_claviron_application_request_header,
     op_claviron_application_request_body,
     op_claviron_application_request_read,
     op_claviron_application_response_whole,
@@ -39,8 +43,13 @@ const runtime = Object.freeze({
         return op_claviron_runtime_yield(value);
     },
 
-    takeApplicationRequestBody(id) {
-        return op_claviron_application_request_body(id);
+    requestMethod(data) { return op_claviron_application_request_method(data); },
+    requestUrl(data) { return op_claviron_application_request_url(data); },
+    requestHeaders(data) { return op_claviron_application_request_headers(data); },
+    requestHeader(data, name) { return op_claviron_application_request_header(data, name); },
+
+    takeApplicationRequestBody(data) {
+        return op_claviron_application_request_body(data);
     },
 
     readRequestBody(id) {

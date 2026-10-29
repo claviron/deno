@@ -4,49 +4,25 @@
         throw new TypeError("JavaScript application must default-export a fetch function or an object with fetch(request)");
     }
     const runtime = globalThis[Symbol.for("claviron.runtime")];
-    const takeResponseBody = globalThis[Symbol.for("claviron.response.body")];
+    const http = globalThis[Symbol.for("claviron.http")](runtime);
     const requests = new Map();
 
-    async function dispatch(id, method, url, headers, streamed, hasBody) {
-        const abort = new AbortController();
-        const context = { abort, reader: null };
+    async function dispatch(id, bodyKind, data) {
+        const request = http.createRequest(id, bodyKind, data);
+        const context = { request, reader: null };
         requests.set(id, context);
         try {
-            let body;
-            if (streamed) {
-                body = new ReadableStream({
-                    async pull(controller) {
-                        try {
-                            const chunk = await runtime.readRequestBody(id);
-                            if (chunk.length === 0) controller.close();
-                            else controller.enqueue(chunk);
-                        } catch (error) {
-                            controller.error(error);
-                        }
-                    },
-                });
-            } else if (hasBody) {
-                body = runtime.takeApplicationRequestBody(id);
-            }
-            const request = new Request(url, {
-                method,
-                headers,
-                body,
-                duplex: "half",
-                signal: abort.signal,
-            });
-            const response = await handler.call(application, request);
+            let response = handler.call(application, request);
             if (!(response instanceof Response)) {
-                throw new TypeError("JavaScript application fetch handler must return a Response");
+                response = await response;
+                if (!(response instanceof Response)) {
+                    throw new TypeError("JavaScript application fetch handler must return a Response");
+                }
             }
-            const responseHeaders = Array.from(response.headers);
-            const source = takeResponseBody(response);
+            const source = http.respond(id, response);
+            if (source === null) return;
             if (!(source instanceof ReadableStream)) {
-                runtime.respondWhole(id, response.status, responseHeaders, source);
-                return;
-            }
-            if (!runtime.respondHead(id, response.status, responseHeaders)) {
-                await source.cancel();
+                await source;
                 return;
             }
             const reader = source.getReader();
@@ -74,7 +50,7 @@
         const context = requests.get(id);
         if (context === undefined) return;
         const reason = new DOMException("Request cancelled", "AbortError");
-        context.abort.abort(reason);
+        http.abortRequest(context.request);
         // Cancellation also wakes a reader parked on a producer with no new data.
         if (context.reader !== null) {
             context.reader.cancel(reason).catch(() => {});
@@ -84,10 +60,9 @@
         await application?.shutdown?.call(application);
     };
     globalThis[Symbol.for("claviron.application.drain")] = () => {
-        const reason = new DOMException("Application stopping", "AbortError");
         for (const context of requests.values()) {
             // Signal owned work; keep accepted body I/O alive for its drain.
-            context.abort.abort(reason);
+            http.abortRequest(context.request);
         }
     };
 }

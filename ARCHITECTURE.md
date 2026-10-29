@@ -74,14 +74,33 @@ The per-instance one-request semaphore is removed.
 
 The bridge converts Claviron HTTP requests to Web `Request` values and Web
 `Response` values back to Claviron responses. HTTP request/response parts and
-their `HeaderMap` move through the mailbox and adapter directly. The owner
-passes method, absolute URI, header pairs and body flags as V8 function
-arguments. Replies supply a numeric status and header arrays to native ops;
-neither direction encodes or parses a JSON head. HTTP header values preserve
-Fetch ByteString (Latin-1) bytes, including repeated fields. V8 strings and Rust
-owned response headers are allocated at the isolate boundary; bodies retain
-their existing byte/stream ownership. Header array access permits guest getters
-without retaining an OpState or request-resource borrow across guest execution.
+their `HeaderMap` move through the mailbox and adapter directly. Dispatch passes
+an exchange handle, body kind and a Deno GC-backed object holding the method,
+URI, headers and buffered body. With `fetch`, Deno's `fromInnerRequest`
+constructs the branded Web Request over an isolate-local inner target. Method,
+URL, headers, body and signal are materialized when accessed. Metadata ops read
+the typed backing object directly, without looking up the live exchange.
+Retained Requests keep their metadata and buffered body readable after a reply;
+the backing object owns no admission permit, live stream endpoint, response
+sender or transport extensions. Those remain in the separately closed exchange
+resource. Cloning and body consumption use Deno's Fetch types.
+Native buffered capacity and known metadata storage contribute to V8 external
+memory pressure. Moving buffered bytes into an ArrayBuffer removes the native
+charge; a weak V8 finalizer releases the remaining charge on collection. This
+is payload accounting, not an exact report of opaque HeaderMap/Uri allocator
+overhead, and it does not retain a strong handle to the Request.
+The inbound-only shim retains its existing eager Request construction.
+
+Ready replies use Deno's existing static Response fields, without a public
+Headers iterator or an intermediate TextEncoder buffer. Native ops take an
+owned UTF-8 or byte copy before replying across threads; mutable V8 memory is
+not shared with the HTTP owner. Other responses use Deno's `wireHeaderList`,
+including its decoded-body header handling. Neither direction encodes or parses
+a JSON head. Header values preserve Fetch ByteString (Latin-1) bytes, including
+repeated fields. Header array access permits guest getters without retaining an
+OpState or request-resource borrow across guest execution. This bridge uses
+compatible `deno_fetch` internals; it does not import Deno's HTTP transport or
+change Claviron's application scheduling.
 Each call owns a native request
 resource handle containing its request, reply, body endpoints, cancellation and
 admission lifetime. No singleton request/reply slots remain in `OpState`.

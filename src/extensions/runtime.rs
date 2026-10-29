@@ -9,6 +9,7 @@ use crate::ExtensionContext;
 use crate::application::{
     RESPONSE_BODY_CAPACITY, RequestResource, RequestResources,
 };
+use crate::engine::request_data::RequestData;
 
 #[op2]
 #[string]
@@ -63,16 +64,73 @@ fn request_resource(
     Ok(request)
 }
 
+fn byte_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Result<v8::Local<'s, v8::String>, deno_error::JsErrorBox> {
+    v8::String::new_from_one_byte(scope, bytes, v8::NewStringType::Normal)
+        .ok_or_else(|| {
+            deno_error::JsErrorBox::range_error("HTTP field exceeds V8 limits")
+        })
+}
+
+#[op2]
+fn op_claviron_application_request_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[cppgc] data: &RequestData,
+) -> Result<v8::Local<'s, v8::String>, deno_error::JsErrorBox> {
+    byte_string(scope, data.method.as_str().as_bytes())
+}
+
+#[op2]
+#[string]
+fn op_claviron_application_request_url(#[cppgc] data: &RequestData) -> String {
+    data.uri.to_string()
+}
+
+#[op2]
+fn op_claviron_application_request_headers<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[cppgc] data: &RequestData,
+) -> Result<v8::Local<'s, v8::Array>, deno_error::JsErrorBox> {
+    let mut headers = Vec::with_capacity(data.headers.len());
+    for (name, value) in &data.headers {
+        let name = byte_string(scope, name.as_str().as_bytes())?;
+        let value = byte_string(scope, value.as_bytes().trim_ascii())?;
+        headers.push(
+            v8::Array::new_with_elements(scope, &[name.into(), value.into()])
+                .into(),
+        );
+    }
+    Ok(v8::Array::new_with_elements(scope, &headers))
+}
+
+#[op2]
+fn op_claviron_application_request_header<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    #[cppgc] data: &RequestData,
+    #[string] name: &str,
+) -> Result<Option<v8::Local<'s, v8::String>>, deno_error::JsErrorBox> {
+    let mut values = data.headers.get_all(name).iter();
+    let Some(first) = values.next() else { return Ok(None) };
+    let Some(second) = values.next() else {
+        return byte_string(scope, first.as_bytes().trim_ascii()).map(Some);
+    };
+    let mut joined = first.as_bytes().trim_ascii().to_vec();
+    for value in std::iter::once(second).chain(values) {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(value.as_bytes().trim_ascii());
+    }
+    byte_string(scope, &joined).map(Some)
+}
+
 #[op2]
 #[buffer]
 fn op_claviron_application_request_body(
-    state: &OpState,
-    #[number] id: u64,
+    scope: &mut v8::PinScope,
+    #[cppgc] data: &RequestData,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    let resource = request_resource(state, id)?;
-    resource.request_body.borrow_mut().take().ok_or_else(|| {
-        deno_error::JsErrorBox::type_error("request body was already consumed")
-    })
+    data.take_body(scope)
 }
 
 /// Only a live request body enters this path; its receiver has one owner.
@@ -110,11 +168,26 @@ fn op_claviron_application_response_whole(
     state: Rc<RefCell<OpState>>,
     #[number] id: u64,
     status: f64,
-    headers: v8::Local<v8::Array>,
-    #[buffer(copy)] body: Vec<u8>,
+    headers: v8::Local<v8::Value>,
+    body: v8::Local<v8::Value>,
 ) -> Result<bool, deno_error::JsErrorBox> {
     let status = response_status(status)?;
     let headers = response_headers(scope, headers)?;
+    // Own guest bytes before handing the reply to another thread. Static text
+    // goes straight to UTF-8 here, without an intermediate JS Uint8Array.
+    let body = if body.is_null_or_undefined() {
+        Vec::new()
+    } else if let Ok(text) = v8::Local::<v8::String>::try_from(body) {
+        text.to_rust_string_lossy(scope).into_bytes()
+    } else if let Ok(view) = v8::Local::<v8::Uint8Array>::try_from(body) {
+        let mut bytes = vec![0; view.byte_length()];
+        view.copy_contents(&mut bytes);
+        bytes
+    } else {
+        return Err(deno_error::JsErrorBox::type_error(
+            "response body must be text or bytes",
+        ));
+    };
     let resource = request_resource(&state.borrow(), id)?;
     let reply = resource.reply.borrow_mut().take().ok_or_else(|| {
         deno_error::JsErrorBox::type_error("response head was already sent")
@@ -134,7 +207,7 @@ fn op_claviron_application_response_head(
     state: Rc<RefCell<OpState>>,
     #[number] id: u64,
     status: f64,
-    headers: v8::Local<v8::Array>,
+    headers: v8::Local<v8::Value>,
 ) -> Result<bool, deno_error::JsErrorBox> {
     let status = response_status(status)?;
     let headers = response_headers(scope, headers)?;
@@ -174,7 +247,7 @@ fn response_status(
 /// Array access can invoke guest getters; hold no OpState/resource borrow here.
 fn response_headers(
     scope: &mut v8::PinScope,
-    headers: v8::Local<v8::Array>,
+    headers: v8::Local<v8::Value>,
 ) -> Result<http::HeaderMap, deno_error::JsErrorBox> {
     fn bytes(
         scope: &mut v8::PinScope,
@@ -195,6 +268,25 @@ fn response_headers(
         string.write_one_byte_v2(scope, 0, &mut bytes, v8::WriteFlags::empty());
         Ok(bytes)
     }
+    // Deno's ready responses carry either no headers or one content type.
+    // Keep that representation instead of manufacturing a header pair array.
+    if headers.is_null_or_undefined() {
+        return Ok(http::HeaderMap::new());
+    }
+    if headers.is_string() {
+        let value = http::HeaderValue::from_maybe_shared(bytes::Bytes::from(
+            bytes(scope, headers)?,
+        ))
+        .map_err(|error| {
+            deno_error::JsErrorBox::type_error(error.to_string())
+        })?;
+        let mut result = http::HeaderMap::with_capacity(1);
+        result.insert(http::header::CONTENT_TYPE, value);
+        return Ok(result);
+    }
+    let headers = v8::Local::<v8::Array>::try_from(headers).map_err(|_| {
+        deno_error::JsErrorBox::type_error("response headers must be an array")
+    })?;
     let mut result = http::HeaderMap::try_with_capacity(
         headers.length() as usize
     )
@@ -303,6 +395,10 @@ deno_core::extension!(
         op_claviron_cancelled,
         op_claviron_environment,
         op_claviron_runtime_yield,
+        op_claviron_application_request_method,
+        op_claviron_application_request_url,
+        op_claviron_application_request_headers,
+        op_claviron_application_request_header,
         op_claviron_application_request_body,
         op_claviron_application_request_read,
         op_claviron_application_response_whole,

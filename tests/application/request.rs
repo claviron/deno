@@ -3,7 +3,6 @@ use super::*;
 fn resource(reply: ReplySender) -> RequestResource {
     RequestResource {
         has_input: false,
-        request_body: RefCell::new(None),
         input: RefCell::new(None),
         reply: RefCell::new(Some(reply)),
         output: RefCell::new(None),
