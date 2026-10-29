@@ -46,6 +46,10 @@ mailbox without rebuilding method/header strings. Metadata crosses into V8 as
 native values, with no JSON head encoding or parsing.
 
 `max_waiting` bounds accepted requests, including unfinished response producers.
+HTTP requests enter the isolate's mailbox using that admission permit alone.
+`engine.command_queue_capacity` bounds only queued non-HTTP commands, such as
+application events, WebSocket events and shutdown. They share the HTTP FIFO;
+HTTP does not wait for a second mailbox-capacity permit.
 `execution_timeout` bounds the wait from acceptance to response headers. Expiry
 signals that request's `AbortSignal` and cancels its bridge I/O; it does not
 terminate the shared isolate. Synchronous JavaScript still runs on one thread:

@@ -120,7 +120,8 @@ impl JsConfig {
 pub struct EngineConfig {
     pub fetch: FetchConfig,
     pub websocket: WebSocketConfig,
-    /// Commands waiting for an application isolate owner.
+    /// Non-HTTP commands waiting for an application isolate owner.
+    /// HTTP requests are bounded only by the application's `max_waiting`.
     #[serde(default = "default_command_queue_capacity")]
     pub command_queue_capacity: usize,
     /// How long a stopping isolate may take to finish the work it already

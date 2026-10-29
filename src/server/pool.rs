@@ -27,6 +27,8 @@ use crate::{
     CoreApplication, Error, Result,
 };
 
+use super::mailbox;
+
 enum WorkerCommand {
     Execute {
         request: ApplicationRequest,
@@ -60,7 +62,7 @@ enum WorkerCommand {
 }
 
 struct ApplicationWorker {
-    sender: mpsc::Sender<WorkerCommand>,
+    sender: mailbox::Sender<WorkerCommand>,
     thread: Mutex<Option<JoinHandle<()>>>,
     /// Requests this generation of the instance completed. A worker that
     /// served anything proved itself, so its failure counter starts over —
@@ -184,14 +186,14 @@ pub(crate) struct JsPoolSnapshot {
 /// that finishes the handshake. Opaque outside the crate.
 pub struct WebSocketLease {
     id: u32,
-    worker: mpsc::Sender<WorkerCommand>,
+    worker: mailbox::Sender<WorkerCommand>,
     limits: WebSocketConfig,
 }
 
 #[cfg(feature = "websocket")]
 pub(crate) struct WebSocketSession {
     id: u32,
-    worker: mpsc::Sender<WorkerCommand>,
+    worker: mailbox::Sender<WorkerCommand>,
     actions: mpsc::Receiver<WebSocketAction>,
     limits: WebSocketConfig,
 }
@@ -378,7 +380,8 @@ impl ApplicationPool {
     }
 
     /// `queue_timeout` is the route's `requests.queue_timeout`: how long this
-    /// request may wait for its isolate. Unset waits; zero rejects at once.
+    /// request may wait for its isolate's acknowledgement. Unset waits;
+    /// zero enqueues without waiting for acknowledgement.
     pub(crate) async fn execute(
         &self,
         request: ApplicationRequest,
@@ -398,34 +401,24 @@ impl ApplicationPool {
             queue_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         let expired =
             || Error::DispatchQueueTimedOut(queue_timeout.unwrap_or_default());
-        let sender = if immediate {
-            worker.sender.try_reserve().map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => expired(),
-                mpsc::error::TrySendError::Closed(_) => {
-                    Error::RequestChannelClosed
-                }
-            })?
-        } else {
-            within(deadline, worker.sender.reserve())
-                .await
-                .ok_or_else(expired)?
-                .map_err(|_| Error::RequestChannelClosed)?
-        };
         let (started, accepted) = oneshot::channel();
         let (reply, response) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let mut guard = RequestGuard(Some(cancellation.clone()));
         worker.counters.active.fetch_add(1, Ordering::Relaxed);
-        sender.send(WorkerCommand::Execute {
-            request,
-            started,
-            reply,
-            lifetime: RequestLifetime {
-                cancellation,
-                _admission: Some(admission),
-                counters: Some(Arc::clone(&worker.counters)),
-            },
-        });
+        worker
+            .sender
+            .send_admitted(WorkerCommand::Execute {
+                request,
+                started,
+                reply,
+                lifetime: RequestLifetime {
+                    cancellation,
+                    _admission: Some(admission),
+                    counters: Some(Arc::clone(&worker.counters)),
+                },
+            })
+            .map_err(|_| Error::RequestChannelClosed)?;
         if !immediate {
             match within(deadline, accepted).await {
                 Some(Ok(())) => {}
@@ -477,7 +470,7 @@ impl ApplicationPool {
             .filter_map(|slot| slot.worker.lock().unwrap().take());
         let workers = workers.collect::<Vec<_>>();
         for worker in &workers {
-            let _ = worker.sender.send(WorkerCommand::Shutdown).await;
+            let _ = worker.sender.send_control(WorkerCommand::Shutdown).await;
         }
         let threads = workers
             .iter()
@@ -581,14 +574,14 @@ impl WebSocketSession {
 
 #[cfg(any(feature = "orbit", feature = "websocket"))]
 async fn send_worker_command(
-    worker: &mpsc::Sender<WorkerCommand>,
+    worker: &mailbox::Sender<WorkerCommand>,
     command: impl FnOnce(
         oneshot::Sender<std::result::Result<(), String>>,
     ) -> WorkerCommand,
 ) -> Result<()> {
     let (reply, response) = oneshot::channel();
     worker
-        .send(command(reply))
+        .send_control(command(reply))
         .await
         .map_err(|_| Error::RequestChannelClosed)?;
     response
@@ -604,7 +597,7 @@ async fn start_worker(
     cancellation: CancellationToken,
     exits: mpsc::UnboundedSender<WorkerExit>,
 ) -> Result<ApplicationWorker> {
-    let (sender, mut receiver) = mpsc::channel(boot.command_queue_capacity);
+    let (sender, mut receiver) = mailbox::channel(boot.command_queue_capacity);
     let (ready_tx, ready_rx) = oneshot::channel();
     let counters = Arc::new(RequestCounters::default());
     let thread_name = format!("js:{}:{instance}", boot.definition.name());

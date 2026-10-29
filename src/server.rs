@@ -1,6 +1,7 @@
 mod adapter;
 mod controller;
 mod framework;
+mod mailbox;
 mod pool;
 pub(crate) mod service;
 #[cfg(feature = "websocket")]

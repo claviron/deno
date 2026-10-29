@@ -67,8 +67,11 @@ a Fetch-style function or an object with `fetch(request)`. Module boot happens
 once per application generation. Each configured instance owns one V8 isolate
 on one OS thread. The owner starts calls without awaiting each call to
 completion, then polls its command mailbox, the V8 event loop and pending call
-completions together. Requests are distributed round-robin through the existing
-bounded typed mailbox; a live `JsRuntime` never crosses the channel. A handler's
+completions together. Requests are distributed round-robin through one typed
+mailbox per isolate. Their retained application admission permit bounds queued
+and executing HTTP work. Non-HTTP commands reserve separate mailbox capacity
+until dequeued. Both use the same FIFO, so shutdown remains behind previously
+enqueued work. A live `JsRuntime` never crosses the channel. A handler's
 asynchronous wait does not reserve an instance. Synchronous JS remains serial.
 The per-instance one-request semaphore is removed.
 
@@ -278,9 +281,13 @@ The application service selects env notifications inside its existing runnable.
 Changed effective values renew only that named application through its joined
 stop/start path. Stopped applications retain their stopped state and use the
 latest valid values on their next start; invalid sources retain live execution.
-`engine.command_queue_capacity` bounds the command mailbox of each
-isolate and defaults to 64. `engine.websocket` carries the transport limits
-the runtime applies around a socket rather than inside the isolate:
+`engine.command_queue_capacity` bounds only the non-HTTP commands waiting in
+each isolate's mailbox and defaults to 64. HTTP dispatch enters the same FIFO
+without reserving a second capacity permit: the application's `max_waiting`
+already bounds these requests until guest completion. Taking a control command
+from the mailbox releases its capacity permit; its callback may remain active.
+`engine.websocket` carries the transport limits the runtime applies around a
+socket rather than inside the isolate:
 `max_message_size` is the ceiling the frame collector reassembles to and the
 size above which an inbound message is refused with 1009, and
 `action_queue_capacity` bounds the actions one application may buffer toward
@@ -292,8 +299,11 @@ request `dispatch` algorithm and execution limits. `round_robin` selects the
 next live instance without allocating a temporary list on each dispatch.
 `max_waiting` bounds queued and executing requests, including live response
 producers after their headers have been sent; its owned permit is released with
-actual guest completion. `requests.queue_timeout` bounds acceptance through the
-mailbox. `execution_timeout` bounds acceptance to the response head and cancels
+actual guest completion. `requests.queue_timeout` bounds the wait for the
+isolate owner's acknowledgement, including time queued behind earlier commands.
+A zero `requests.queue_timeout` enqueues immediately without waiting for the
+owner acknowledgement; HTTP has no separate mailbox-capacity rejection.
+`execution_timeout` bounds acceptance to the response head and cancels
 only that request cooperatively; `null` leaves it unbounded. It never invokes
 V8's isolate-wide `terminate_execution` for an individual request. A synchronous
 non-yielding handler cannot be safely preempted in isolation from its peers.
