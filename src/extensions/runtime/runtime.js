@@ -7,6 +7,8 @@ const {
     op_claviron_cancelled,
     op_claviron_environment,
     op_claviron_runtime_yield,
+    op_claviron_application_request_complete,
+    op_claviron_application_request_error,
     op_claviron_application_request_method,
     op_claviron_application_request_url,
     op_claviron_application_request_headers,
@@ -42,6 +44,9 @@ const runtime = Object.freeze({
     yieldToRuntime(value) {
         return op_claviron_runtime_yield(value);
     },
+
+    completeRequest: op_claviron_application_request_complete,
+    failRequest: op_claviron_application_request_error,
 
     requestMethod(data) { return op_claviron_application_request_method(data); },
     requestUrl(data) { return op_claviron_application_request_url(data); },

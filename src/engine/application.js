@@ -8,10 +8,12 @@
     const requests = new Map();
 
     async function dispatch(id, bodyKind, data) {
-        const request = http.createRequest(id, bodyKind, data);
-        const context = { request, reader: null };
-        requests.set(id, context);
+        let failed = false;
+        let error;
         try {
+            const request = http.createRequest(id, bodyKind, data);
+            const context = { request, reader: null };
+            requests.set(id, context);
             let response = handler.call(application, request);
             if (!(response instanceof Response)) {
                 response = await response;
@@ -40,8 +42,20 @@
                 context.reader = null;
                 reader.releaseLock();
             }
+        } catch (cause) {
+            failed = true;
+            error = cause;
         } finally {
-            requests.delete(id);
+            try {
+                requests.delete(id);
+            } catch (cause) {
+                failed = true;
+                error = cause;
+            }
+            // These ops are installed once per isolate. Report only after
+            // guest cleanup, including failures before Request construction.
+            if (failed) runtime.failRequest(id, error);
+            else runtime.completeRequest(id);
         }
     }
 

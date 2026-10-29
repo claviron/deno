@@ -64,6 +64,34 @@ fn request_resource(
     Ok(request)
 }
 
+/// Notify the owner; it releases request resources after returning from V8.
+#[op2(fast)]
+fn op_claviron_application_request_complete(
+    state: &OpState,
+    #[number] id: u64,
+) {
+    if let Some(request) = state.borrow::<RequestResources>().get(id) {
+        request.complete_execution(Ok(()));
+    }
+}
+
+#[op2(fast, reentrant)]
+fn op_claviron_application_request_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: Rc<RefCell<OpState>>,
+    #[number] id: u64,
+    error: v8::Local<'s, v8::Value>,
+) {
+    let request = state.borrow().borrow::<RequestResources>().get(id);
+    if let Some(request) = request {
+        // Exception conversion can execute guest getters. Retain no OpState
+        // or request-field borrow while preserving Deno's rejection formatting.
+        let error =
+            deno_core::error::exception_to_err(scope, error, true, true);
+        request.complete_execution(Err(error.to_string()));
+    }
+}
+
 fn byte_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
@@ -395,6 +423,8 @@ deno_core::extension!(
         op_claviron_cancelled,
         op_claviron_environment,
         op_claviron_runtime_yield,
+        op_claviron_application_request_complete,
+        op_claviron_application_request_error,
         op_claviron_application_request_method,
         op_claviron_application_request_url,
         op_claviron_application_request_headers,

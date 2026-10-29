@@ -1,3 +1,5 @@
+import { applicationName, yieldToRuntime } from "claviron:runtime";
+
 let release;
 let uploads = 0;
 let uploadsReady;
@@ -15,6 +17,26 @@ export default {
     fetch(request) {
         const path = new URL(request.url).pathname;
         if (path === "/json") return Response.json({ ok: true });
+        if (path === "/throw") throw new Error("synchronous failure");
+        if (path === "/reject") return Promise.reject(new Error("rejected failure"));
+        if (path === "/async-reject") {
+            return yieldToRuntime("ready").then(() => {
+                throw new Error("asynchronous failure");
+            });
+        }
+        if (path === "/throw-undefined") throw undefined;
+        if (path === "/reject-null") return Promise.reject(null);
+        if (path === "/invalid-response") return {};
+        if (path === "/reentrant-error") {
+            const error = new Error("reentrant failure");
+            Object.defineProperty(error, "name", {
+                get() {
+                    applicationName();
+                    return "Error";
+                },
+            });
+            throw error;
+        }
         if (path === "/drain") {
             drainPending = true;
             drainStarted?.();

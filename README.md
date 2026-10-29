@@ -63,8 +63,8 @@ a handler that never yields can block that isolate, and cooperative cancellation
 cannot preempt it.
 
 The explicit `http-concurrency` example exercises overlapping request bodies,
-open response streams, disconnects, producer errors and graceful drain without
-binding a network listener or creating fleet resources:
+open response streams, disconnects, handler/producer errors and graceful drain
+without binding a network listener or creating fleet resources:
 
 ```sh
 cargo run --example http-concurrency --all-features

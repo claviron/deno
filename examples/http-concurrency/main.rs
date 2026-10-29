@@ -7,7 +7,8 @@ use claviron::http::{RouteBody, empty_body};
 use claviron::runtime::registry::Runnable;
 use claviron::runtime::{AppState, RunContext};
 use claviron_deno::{
-    ApplicationDefinition, JsApplicationAdapter, JsApplicationService,
+    ApplicationDefinition, CoreApplication, JsApplicationAdapter,
+    JsApplicationService,
 };
 use deno_core::futures::{StreamExt, stream::FuturesUnordered};
 use http::Request;
@@ -47,6 +48,50 @@ async fn get(
     response.into_body().collect().await.unwrap().to_bytes()
 }
 
+async fn completion_errors(module: &std::path::Path) {
+    let definition = ApplicationDefinition::new("completion", module).unwrap();
+    let mut application = CoreApplication::boot(definition).await.unwrap();
+    for (path, message) in [
+        ("/throw", "synchronous failure"),
+        ("/reject", "rejected failure"),
+        ("/async-reject", "asynchronous failure"),
+        ("/throw-undefined", "undefined"),
+        ("/reject-null", "null"),
+        ("/invalid-response", "fetch handler must return a Response"),
+        ("/reentrant-error", "reentrant failure"),
+    ] {
+        let request = Request::builder()
+            .uri(format!("http://example.test{path}"))
+            .body(claviron_deno::RequestBody::Empty)
+            .unwrap();
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        let error =
+            application.handle(request, reply).await.unwrap_err().to_string();
+        assert!(error.contains(message), "{error}");
+        if matches!(path, "/throw-undefined" | "/reject-null") {
+            assert!(error.contains("Uncaught (in promise)"), "{error}");
+        } else {
+            assert!(error.contains("\n    at "), "{error}");
+        }
+        assert!(replied.await.unwrap().unwrap_err().contains(message));
+
+        let request = Request::builder()
+            .uri("http://example.test/json")
+            .body(claviron_deno::RequestBody::Empty)
+            .unwrap();
+        let (reply, replied) = tokio::sync::oneshot::channel();
+        application.handle(request, reply).await.unwrap();
+        let mut response = replied.await.unwrap().unwrap();
+        assert_eq!(
+            response.body_mut().recv().await.unwrap().unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+    println!(
+        "synchronous throws, asynchronous rejections and reentrant error formatting preserved request-local failures"
+    );
+}
+
 #[tokio::main]
 async fn main() {
     let args = std::env::args().collect::<Vec<_>>();
@@ -57,7 +102,7 @@ async fn main() {
         .join("examples/http-concurrency/application.js");
     service
         .register_application(
-            ApplicationDefinition::new("example", module).unwrap(),
+            ApplicationDefinition::new("example", module.clone()).unwrap(),
         )
         .unwrap();
     let cancellation = CancellationToken::new();
@@ -94,6 +139,21 @@ async fn main() {
             start.elapsed().as_secs_f64() * 1e6 / count as f64
         );
     } else {
+        // Direct embedded Deno ops require an owner-thread Tokio runtime.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(completion_errors(&module));
+        })
+        .await
+        .unwrap();
+        for path in ["/throw", "/reject", "/async-reject", "/invalid-response"]
+        {
+            assert_eq!(adapter.handle(request(path)).await.status(), 500);
+            assert_eq!(get(&adapter, "/json").await, "{\"ok\":true}");
+        }
         for content_type in ["application/octet-stream", "text/event-stream"] {
             let mut opening = request("/stream");
             opening

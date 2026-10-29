@@ -126,11 +126,22 @@ pub(crate) struct RequestResource {
     pub reply: RefCell<Option<ReplySender>>,
     pub output: RefCell<Option<mpsc::Sender<Bytes>>>,
     pub completion: RefCell<Option<oneshot::Sender<Result<(), String>>>>,
+    /// Guest completion is reported separately from the response head/body.
+    pub execution: RefCell<Option<oneshot::Sender<Result<(), String>>>>,
     pub lifetime: RequestLifetime,
     pub closed: Cell<bool>,
 }
 
 impl RequestResource {
+    pub fn complete_execution(
+        &self,
+        result: Result<(), String>,
+    ) {
+        if let Some(execution) = self.execution.borrow_mut().take() {
+            let _ = execution.send(result);
+        }
+    }
+
     pub fn finish(
         &self,
         result: Result<(), String>,

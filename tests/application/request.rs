@@ -7,6 +7,7 @@ fn resource(reply: ReplySender) -> RequestResource {
         reply: RefCell::new(Some(reply)),
         output: RefCell::new(None),
         completion: RefCell::new(None),
+        execution: RefCell::new(None),
         lifetime: RequestLifetime::default(),
         closed: Cell::new(false),
     }
@@ -85,11 +86,47 @@ async fn admission_outlives_the_response_head_and_releases_with_execution() {
         .unwrap();
     replied.await.unwrap().unwrap();
     assert_eq!(admission.available_permits(), 0);
+    let (execution, executed) = oneshot::channel();
+    *request.execution.borrow_mut() = Some(execution);
+    request.complete_execution(Ok(()));
+    executed.await.unwrap().unwrap();
+    assert_eq!(admission.available_permits(), 0);
+    assert_eq!(counters.active.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(counters.served.load(std::sync::atomic::Ordering::Relaxed), 0);
     request.finish(Ok(()));
     drop(request);
     assert_eq!(admission.available_permits(), 1);
     assert_eq!(counters.active.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert_eq!(counters.served.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn execution_failure_is_delivered_once_before_owner_finalization() {
+    let (reply, mut replied) = oneshot::channel();
+    let request = resource(reply);
+    let (execution, executed) = oneshot::channel();
+    *request.execution.borrow_mut() = Some(execution);
+    request.complete_execution(Err("handler failed".into()));
+    request.complete_execution(Ok(()));
+    let result = executed.await.unwrap();
+    assert_eq!(result, Err("handler failed".into()));
+    assert!(!request.closed.get());
+    assert!(matches!(
+        replied.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    request.finish(result);
+    assert_eq!(replied.await.unwrap().unwrap_err(), "handler failed");
+}
+
+#[tokio::test]
+async fn dropping_a_request_wakes_its_pending_execution_receiver() {
+    let (reply, _) = oneshot::channel();
+    let request = resource(reply);
+    let (execution, executed) = oneshot::channel();
+    *request.execution.borrow_mut() = Some(execution);
+    drop(request);
+    assert!(executed.await.is_err());
 }
 
 #[test]

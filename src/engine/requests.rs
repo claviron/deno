@@ -12,10 +12,7 @@ use crate::application::{RequestLifetime, RequestResource, RequestResources};
 use crate::engine::request_data::RequestData;
 use crate::{ApplicationRequest, Error, RequestBody, Result};
 
-type Call = LocalBoxFuture<
-    'static,
-    std::result::Result<v8::Global<v8::Value>, Box<deno_core::error::JsError>>,
->;
+type Call = LocalBoxFuture<'static, std::result::Result<(), String>>;
 pub(super) type PendingRequests =
     FuturesUnordered<LocalBoxFuture<'static, Completion>>;
 
@@ -71,6 +68,7 @@ impl CoreEngine {
         };
         let body_kind = if input.is_some() { 2 } else { u32::from(has_body) };
         let cancellation = lifetime.cancellation.clone();
+        let (completed, completion) = tokio::sync::oneshot::channel();
         let id = self
             .runtime
             .op_state()
@@ -82,12 +80,14 @@ impl CoreEngine {
                 reply: RefCell::new(Some(reply)),
                 output: RefCell::new(None),
                 completion: RefCell::new(None),
+                execution: RefCell::new(Some(completed)),
                 lifetime,
                 closed: Cell::new(false),
             })
             .map_err(|error| Error::ApplicationUnavailable(error.into()))?;
-        let arguments = {
+        let failure = {
             deno_core::scope!(scope, self.runtime);
+            v8::tc_scope!(scope, scope);
             // Metadata stays in Rust until a Web Request getter needs it.
             let data = RequestData::new(parts, body).into_v8(scope);
             let arguments: [v8::Local<v8::Value>; 3] = [
@@ -95,10 +95,38 @@ impl CoreEngine {
                 v8::Integer::new_from_unsigned(scope, body_kind).into(),
                 data.into(),
             ];
-            arguments.map(|value| v8::Global::new(scope, value))
+            let function = v8::Local::new(scope, function);
+            let receiver = v8::undefined(scope);
+            // The bootstrap reports completion through its cached native ops.
+            // Do not wrap its Promise in per-call V8 fulfillment/rejection functions.
+            function.call(scope, receiver.into(), &arguments).is_none().then(
+                || {
+                    let exception = scope
+                        .exception()
+                        .unwrap_or_else(|| v8::undefined(scope).into());
+                    deno_core::error::exception_to_err(
+                        scope, exception, false, true,
+                    )
+                    .to_string()
+                },
+            )
         };
-        let call =
-            self.runtime.call_with_args(function, &arguments).boxed_local();
+        if let Some(error) = failure
+            && let Some(resource) = self
+                .runtime
+                .op_state()
+                .borrow()
+                .borrow::<RequestResources>()
+                .get(id)
+        {
+            resource.complete_execution(Err(error));
+        }
+        let call = async move {
+            completion.await.unwrap_or_else(|_| {
+                Err("JavaScript request execution disappeared".into())
+            })
+        }
+        .boxed_local();
         Ok((id, call, cancellation))
     }
 
@@ -125,12 +153,9 @@ impl CoreEngine {
                 match select(call, cancellation.cancelled_owned().boxed_local())
                     .await
                 {
-                    Either::Left((result, _)) => Completion::Request {
-                        id,
-                        result: result
-                            .map(|_| ())
-                            .map_err(|error| error.to_string()),
-                    },
+                    Either::Left((result, _)) => {
+                        Completion::Request { id, result }
+                    }
                     Either::Right(((), call)) => {
                         Completion::Cancelled { id, call }
                     }
@@ -141,7 +166,7 @@ impl CoreEngine {
     }
 
     /// The convenience API waits for this call and preserves its error result.
-    /// The managed HTTP path uses start_request and needs no completion channel.
+    /// The managed HTTP path uses start_request without this additional waiter.
     pub(crate) async fn handle(
         &mut self,
         request: ApplicationRequest,
@@ -152,9 +177,7 @@ impl CoreEngine {
         let (completed, mut done) = tokio::sync::oneshot::channel();
         let call = async move {
             let result = call.await;
-            let _ = completed.send(
-                result.as_ref().map(|_| ()).map_err(|error| error.to_string()),
-            );
+            let _ = completed.send(result.clone());
             result
         }
         .boxed_local();
@@ -276,13 +299,7 @@ impl CoreEngine {
                     }
                     self.pending.push(
                         async move {
-                            Completion::Request {
-                                id,
-                                result: call
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(|error| error.to_string()),
-                            }
+                            Completion::Request { id, result: call.await }
                         }
                         .boxed_local(),
                     );

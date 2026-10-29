@@ -87,6 +87,18 @@ enqueued work. A live `JsRuntime` never crosses the channel. A handler's
 asynchronous wait does not reserve an instance. Synchronous JS remains serial.
 The per-instance one-request semaphore is removed.
 
+HTTP dispatch invokes its cached V8 function directly with local handles. The
+async JavaScript dispatch reports success or its original thrown value through
+native completion ops installed once per isolate, after its cleanup finishes.
+Rust converts errors with Deno's rejection formatter, without borrowing OpState
+across guest getters, and wakes only that request's execution receiver. It does
+not install per-request V8 fulfillment/rejection callbacks or scan pending
+Promises. The owner consumes completion before closing the exchange and
+releasing admission; a response head alone does not release execution ownership.
+Cancellation still delivers the request's AbortSignal and retains the same
+completion receiver until guest cleanup finishes. Non-HTTP commands retain
+their existing Promise observation.
+
 The bridge converts Claviron HTTP requests to Web `Request` values and Web
 `Response` values back to Claviron responses. HTTP request/response parts and
 their `HeaderMap` move through the mailbox and adapter directly. Dispatch passes
