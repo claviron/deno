@@ -8,7 +8,9 @@ use deno_core::futures::{FutureExt, StreamExt};
 use deno_core::v8;
 
 use super::CoreEngine;
-use crate::application::{RequestLifetime, RequestResource, RequestResources};
+use crate::application::{
+    RequestLifetime, RequestResource, RequestResources, execution_completion,
+};
 use crate::engine::request_data::RequestData;
 use crate::{ApplicationRequest, Error, RequestBody, Result};
 
@@ -68,7 +70,7 @@ impl CoreEngine {
         };
         let body_kind = if input.is_some() { 2 } else { u32::from(has_body) };
         let cancellation = lifetime.cancellation.clone();
-        let (completed, completion) = tokio::sync::oneshot::channel();
+        let (completed, completion) = execution_completion();
         let id = self
             .runtime
             .op_state()
@@ -121,13 +123,7 @@ impl CoreEngine {
         {
             resource.complete_execution(Err(error));
         }
-        let call = async move {
-            completion.await.unwrap_or_else(|_| {
-                Err("JavaScript request execution disappeared".into())
-            })
-        }
-        .boxed_local();
-        Ok((id, call, cancellation))
+        Ok((id, completion.boxed_local(), cancellation))
     }
 
     pub(crate) fn start_request(

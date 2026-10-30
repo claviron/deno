@@ -1,9 +1,11 @@
 mod definition;
+mod execution;
 mod message;
 mod request;
 mod runtime;
 
 pub use definition::ApplicationDefinition;
+pub(crate) use execution::{ExecutionSender, execution_completion};
 pub(crate) use message::RESPONSE_BODY_CAPACITY;
 pub use message::{
     ApplicationRequest, ApplicationResponse, ReplySender, RequestBody,

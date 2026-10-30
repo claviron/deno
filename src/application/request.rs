@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::ReplySender;
+use super::{ExecutionSender, ReplySender};
 
 /// A complete response avoids a channel; a live producer allocates one on demand.
 #[derive(Debug)]
@@ -127,7 +127,7 @@ pub(crate) struct RequestResource {
     pub output: RefCell<Option<mpsc::Sender<Bytes>>>,
     pub completion: RefCell<Option<oneshot::Sender<Result<(), String>>>>,
     /// Guest completion is reported separately from the response head/body.
-    pub execution: RefCell<Option<oneshot::Sender<Result<(), String>>>>,
+    pub execution: RefCell<Option<ExecutionSender>>,
     pub lifetime: RequestLifetime,
     pub closed: Cell<bool>,
 }
@@ -137,8 +137,9 @@ impl RequestResource {
         &self,
         result: Result<(), String>,
     ) {
-        if let Some(execution) = self.execution.borrow_mut().take() {
-            let _ = execution.send(result);
+        let execution = self.execution.borrow_mut().take();
+        if let Some(execution) = execution {
+            execution.complete(result);
         }
     }
 

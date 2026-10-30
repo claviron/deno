@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::execution_completion;
 
 fn resource(reply: ReplySender) -> RequestResource {
     RequestResource {
@@ -86,10 +87,10 @@ async fn admission_outlives_the_response_head_and_releases_with_execution() {
         .unwrap();
     replied.await.unwrap().unwrap();
     assert_eq!(admission.available_permits(), 0);
-    let (execution, executed) = oneshot::channel();
+    let (execution, executed) = execution_completion();
     *request.execution.borrow_mut() = Some(execution);
     request.complete_execution(Ok(()));
-    executed.await.unwrap().unwrap();
+    executed.await.unwrap();
     assert_eq!(admission.available_permits(), 0);
     assert_eq!(counters.active.load(std::sync::atomic::Ordering::Relaxed), 1);
     assert_eq!(counters.served.load(std::sync::atomic::Ordering::Relaxed), 0);
@@ -104,11 +105,11 @@ async fn admission_outlives_the_response_head_and_releases_with_execution() {
 async fn execution_failure_is_delivered_once_before_owner_finalization() {
     let (reply, mut replied) = oneshot::channel();
     let request = resource(reply);
-    let (execution, executed) = oneshot::channel();
+    let (execution, executed) = execution_completion();
     *request.execution.borrow_mut() = Some(execution);
     request.complete_execution(Err("handler failed".into()));
     request.complete_execution(Ok(()));
-    let result = executed.await.unwrap();
+    let result = executed.await;
     assert_eq!(result, Err("handler failed".into()));
     assert!(!request.closed.get());
     assert!(matches!(
@@ -123,7 +124,7 @@ async fn execution_failure_is_delivered_once_before_owner_finalization() {
 async fn dropping_a_request_wakes_its_pending_execution_receiver() {
     let (reply, _) = oneshot::channel();
     let request = resource(reply);
-    let (execution, executed) = oneshot::channel();
+    let (execution, executed) = execution_completion();
     *request.execution.borrow_mut() = Some(execution);
     drop(request);
     assert!(executed.await.is_err());

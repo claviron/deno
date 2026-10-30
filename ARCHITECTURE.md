@@ -99,6 +99,12 @@ Cancellation still delivers the request's AbortSignal and retains the same
 completion receiver until guest cleanup finishes. Non-HTTP commands retain
 their existing Promise observation.
 
+Execution completion is an owner-local `Rc`-backed result and waker, not a
+thread-safe channel. An early completion is retained until first polled; loss
+of its sender wakes the owner with an error. It consumes no Tokio cooperative
+budget. The owner still finalizes requests outside V8. Response delivery and
+live body channels cross threads and retain their existing synchronization.
+
 The bridge converts Claviron HTTP requests to Web `Request` values and Web
 `Response` values back to Claviron responses. HTTP request/response parts and
 their `HeaderMap` move through the mailbox and adapter directly. Dispatch passes
