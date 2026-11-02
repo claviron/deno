@@ -1,34 +1,33 @@
-//! Cold compilation of the edge's `js:` directive into an owned HTTP router.
+//! Compile the edge's `js:` directive into a native host contribution.
 
 use std::sync::Arc;
 
-use axum::Router;
-use axum::extract::Request;
-use claviron::edge::{HostAppRegistry, HostConfig};
+use claviron::edge::HostAppRegistry;
+use claviron::edge::pipeline::extension::{
+    HostHandler, HostHandlerFuture, HostRequest, RouteContext, RouteEffect,
+    RouteExtension,
+};
+use claviron::http::ServiceResult;
 use claviron::http::policy::HttpPolicyOverride;
-use claviron::http::routing::{RouteContext, RouteEffect, RouteExtension};
-use claviron::http::{boxed_body, into_axum_response};
 use claviron::runtime::AppState;
 use claviron::runtime::registry::{Error, Result};
 
 use super::JavaScriptRouteConfig;
 use crate::{JsApplicationAdapter, JsApplicationService};
 
-/// Binds a vhost route prefix to a named application prepared from `js.yaml`.
-///
-/// `claviron_deno::register` installs this compiler when an edge registry is
-/// present. Parsing and service resolution happen only at snapshot preparation.
+/// Bind a host route prefix to an application prepared from `js.yaml`.
+/// Parsing and service resolution happen only during host preparation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JsRouteExtension;
 
-impl RouteExtension<HostConfig> for JsRouteExtension {
+impl RouteExtension for JsRouteExtension {
     fn name(&self) -> &'static str {
         "js"
     }
 
     fn resolve(
         &self,
-        context: &RouteContext<'_, HostConfig>,
+        context: &RouteContext<'_>,
         source: &serde_yaml::Value,
     ) -> Result<RouteEffect> {
         let compile = || {
@@ -46,41 +45,65 @@ impl RouteExtension<HostConfig> for JsRouteExtension {
                     config.application
                 )));
             }
-            let adapter = Arc::new(
-                JsApplicationAdapter::new(
-                    Arc::clone(&service),
-                    config.application.as_str(),
-                )
-                .route_policy(HttpPolicyOverride {
-                    requests: config.requests,
-                    responses: config.responses,
-                }),
-            );
-            // Edge already selects the prefix. Preserve the admitted URI,
-            // connection context and body; no second prefix dispatch is needed.
-            let router = Router::new().fallback(move |request: Request| {
-                let adapter = Arc::clone(&adapter);
-                async move {
-                    let (parts, body) = request.into_parts();
-                    into_axum_response(
-                        adapter
-                            .handle(http::Request::from_parts(
-                                parts,
-                                boxed_body(body),
-                            ))
-                            .await,
-                    )
-                }
+            let adapter = JsApplicationAdapter::new(
+                Arc::clone(&service),
+                config.application.as_str(),
+            )
+            .route_policy(HttpPolicyOverride {
+                requests: config.requests,
+                responses: config.responses,
             });
-            Ok(RouteEffect::Handler(with_websockets(
-                router, context, &config, service,
-            )?))
+            #[cfg(not(feature = "websocket"))]
+            if !config.websockets().is_empty() {
+                return Err(Error::msg(
+                    "WebSocket routes require the websocket feature",
+                ));
+            }
+            Ok(RouteEffect::Handler(Arc::new(JsHostHandler {
+                adapter,
+                #[cfg(feature = "websocket")]
+                sockets: SocketRoutes::prepare(context, &config, service)?,
+            })))
         };
         compile().map_err(|error| {
             Error::msg(format!(
                 "host '{}' route '{}' directive 'js': {error}",
                 context.host, context.prefix
             ))
+        })
+    }
+}
+
+struct JsHostHandler {
+    adapter: JsApplicationAdapter,
+    #[cfg(feature = "websocket")]
+    sockets: Option<Arc<SocketRoutes>>,
+}
+
+impl HostHandler for JsHostHandler {
+    fn call(
+        &self,
+        request: HostRequest,
+    ) -> HostHandlerFuture {
+        let adapter = self.adapter.clone();
+        #[cfg(feature = "websocket")]
+        let sockets = self.sockets.clone();
+        Box::pin(async move {
+            // Edge selected this prefix. Move the admitted request and unread
+            // body directly to the application, without an Axum router.
+            let request = request.into_request();
+            #[cfg(feature = "websocket")]
+            let request = if let Some(sockets) = sockets {
+                match sockets.dispatch(request).await {
+                    ServiceResult::Handled(response) => {
+                        return ServiceResult::Handled(response);
+                    }
+                    ServiceResult::Unhandled(request) => request,
+                }
+            } else {
+                request
+            };
+            ServiceResult::Handled(adapter.handle(request).await)
         })
     }
 }
@@ -96,7 +119,6 @@ fn parse(source: &serde_yaml::Value) -> Result<JavaScriptRouteConfig> {
 }
 
 pub(crate) fn register(state: &AppState) -> Result<()> {
-    // Compiled support is not placement: a plain Axum consumer has no edge.
     if let Some(hosts) = state.registry_ref().resolve::<HostAppRegistry>() {
         hosts.register_route_extension(Arc::new(JsRouteExtension))?;
     }
@@ -104,92 +126,80 @@ pub(crate) fn register(state: &AppState) -> Result<()> {
 }
 
 #[cfg(feature = "websocket")]
-fn with_websockets(
-    router: Router<AppState>,
-    context: &RouteContext<'_, HostConfig>,
-    config: &JavaScriptRouteConfig,
-    service: Arc<JsApplicationService>,
-) -> Result<Router<AppState>> {
-    use axum::middleware;
-    use axum::middleware::Next;
-    use axum::response::IntoResponse;
-    use claviron::websocket::{
-        H1UpgradeMiddlewareState, H1UpgradeRegistry, h1_upgrade_middleware,
-    };
-
-    if config.websockets().is_empty() {
-        return Ok(router);
-    }
-    if !context.config.transport.h1.upgrade {
-        return Err(Error::msg(
-            "WebSocket routes require transport.h1.upgrade: true",
-        ));
-    }
-    // Owned by this candidate router, never inserted into a live global
-    // registry. A failed reload leaves the previous bindings untouched.
-    let registry = Arc::new(H1UpgradeRegistry::default());
-    let handler = Arc::new(crate::JsWebSocketUpgradeHandler::new(
-        service,
-        config.application.as_str(),
-    ));
-    for websocket in config.websockets() {
-        registry.register_handler(
-            context.host.clone(),
-            mounted_path(context.prefix, &websocket.path),
-            handler.clone(),
-        )?;
-    }
-    let bindings = H1UpgradeMiddlewareState {
-        app_state: context.state.clone(),
-        registry,
-        host: context.host.clone(),
-    };
-    let h2_bindings = bindings.clone();
-    let h2_enabled = context.config.transport.h2.connect_protocol;
-    Ok(router
-        .layer(middleware::from_fn_with_state(bindings, h1_upgrade_middleware))
-        .layer(middleware::from_fn(move |request: Request, next: Next| {
-            let bindings = h2_bindings.clone();
-            let handler = handler.clone();
-            async move {
-                if request.version() != http::Version::HTTP_2
-                    || request.method() != http::Method::CONNECT
-                    || bindings
-                        .registry
-                        .resolve(&bindings.host, request.uri().path())
-                        .is_none()
-                {
-                    return next.run(request).await;
-                }
-                if !h2_enabled {
-                    return http::StatusCode::FORBIDDEN.into_response();
-                }
-                let (parts, body) = request.into_parts();
-                into_axum_response(
-                    handler
-                        .handle_connect(
-                            bindings.app_state,
-                            http::Request::from_parts(parts, boxed_body(body)),
-                        )
-                        .await,
-                )
-            }
-        })))
+struct SocketRoutes {
+    state: AppState,
+    host: claviron::edge::Host,
+    paths: std::collections::HashMap<
+        Arc<str>,
+        claviron::websocket::H1UpgradeBinding,
+    >,
+    handler: Arc<crate::JsWebSocketUpgradeHandler>,
+    h2_enabled: bool,
 }
 
-#[cfg(not(feature = "websocket"))]
-fn with_websockets(
-    router: Router<AppState>,
-    _context: &RouteContext<'_, HostConfig>,
-    config: &JavaScriptRouteConfig,
-    _service: Arc<JsApplicationService>,
-) -> Result<Router<AppState>> {
-    if !config.websockets().is_empty() {
-        return Err(Error::msg(
-            "WebSocket routes require the websocket feature",
+#[cfg(feature = "websocket")]
+impl SocketRoutes {
+    fn prepare(
+        context: &RouteContext<'_>,
+        config: &JavaScriptRouteConfig,
+        service: Arc<JsApplicationService>,
+    ) -> Result<Option<Arc<Self>>> {
+        if config.websockets().is_empty() {
+            return Ok(None);
+        }
+        if !context.config.transport.h1.upgrade {
+            return Err(Error::msg(
+                "WebSocket routes require transport.h1.upgrade: true",
+            ));
+        }
+        let registry = claviron::websocket::H1UpgradeRegistry::default();
+        let handler = Arc::new(crate::JsWebSocketUpgradeHandler::new(
+            service,
+            config.application.as_str(),
         ));
+        for websocket in config.websockets() {
+            registry.register_handler(
+                context.host.clone(),
+                mounted_path(context.prefix, &websocket.path),
+                handler.clone(),
+            )?;
+        }
+        Ok(Some(Arc::new(Self {
+            state: context.state.clone(),
+            host: context.host.clone(),
+            paths: registry.snapshot_for_host(context.host),
+            handler,
+            h2_enabled: context.config.transport.h2.connect_protocol,
+        })))
     }
-    Ok(router)
+
+    async fn dispatch(
+        &self,
+        request: http::Request<claviron::http::RouteBody>,
+    ) -> ServiceResult<
+        claviron::http::RouteResponse,
+        http::Request<claviron::http::RouteBody>,
+    > {
+        let Some(binding) = self.paths.get(request.uri().path()) else {
+            return ServiceResult::Unhandled(request);
+        };
+        if request.version() == http::Version::HTTP_2
+            && request.method() == http::Method::CONNECT
+        {
+            return ServiceResult::Handled(if self.h2_enabled {
+                self.handler.handle_connect(self.state.clone(), request).await
+            } else {
+                claviron::http::err_status(http::StatusCode::FORBIDDEN)
+            });
+        }
+        claviron::websocket::try_h1_upgrade(
+            self.state.clone(),
+            self.host.clone(),
+            binding.clone(),
+            request,
+        )
+        .await
+    }
 }
 
 #[cfg(feature = "websocket")]

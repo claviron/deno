@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
 use claviron::runtime::AppState;
 use claviron::runtime::registry::{
     Error as RegistryError, Result as RegistryResult,
@@ -148,7 +147,7 @@ impl H1UpgradeHandler for JsWebSocketUpgradeHandler {
 
     fn is_upgrade(
         &self,
-        req: &Request<Body>,
+        req: &Request<claviron::http::RouteBody>,
     ) -> bool {
         is_h1_header_upgrade(req, "websocket")
     }

@@ -135,6 +135,7 @@ impl ApplicationDefinition {
         &self.env_file
     }
 
+    #[cfg(any(feature = "server", test))]
     pub(crate) fn resolved_environment(
         mut self,
         values: BTreeMap<String, String>,

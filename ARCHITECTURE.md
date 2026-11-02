@@ -41,7 +41,10 @@ Deno CLI/runtime environment.
 - `routing` uses the same `server` feature and owns Axum mounting, its typed
   JavaScript mount declarations and dispatch. Its builder never needs Edge's
   HostConfig or a JS feature in Claviron.
-- The optional `edge` feature adds the existing Edge route-extension binding.
+- The optional `edge` feature compiles `js:` into a native HostPipeline handler.
+  The admitted request and unread body move directly into the application
+  adapter; this path does not construct an Axum router. Optional WebSocket
+  endpoints use the same snapshot-owned bindings and listener session owner.
   It is a topology boundary, not another engine: plain Axum consumers do not
   acquire Edge. Claviron and Edge retain no dependency on this Deno crate.
 - `backend::deno` is a hidden native extension seam. Deno and V8 types stay

@@ -1,5 +1,5 @@
 use super::*;
-use claviron::edge::Host;
+use claviron::edge::{Host, HostConfig};
 use claviron::http::ext::PathPrefix;
 
 fn prefix(value: &str) -> PathPrefix {
