@@ -9,10 +9,10 @@ use claviron::app::{
     ApplicationEvent, ApplicationId, ApplicationName, ApplicationRuntime,
     EventArrayKey, EventValue,
 };
+use claviron::orbit::link::{InterestGuard, LinkInterest};
 use claviron::orbit::lock::{
     LockAcquire, LockKey, LockOwner, LockType, OrbitLock,
 };
-use claviron::orbit::transport::{InterestGuard, LinkInterest};
 use claviron::orbit::{
     Cells, CellsProvider, Counter, CounterProvider, FleetProvider,
     InvocationBus, InvocationProvider,

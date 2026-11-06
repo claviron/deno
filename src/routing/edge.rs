@@ -1,35 +1,47 @@
-//! Compile the edge's `js:` directive into a native host contribution.
+//! Prepare the edge's `js:` backend without an application router wrapper.
 
 use std::sync::Arc;
 
 use claviron::edge::HostAppRegistry;
-use claviron::edge::pipeline::extension::{
-    HostHandler, HostHandlerFuture, HostRequest, RouteContext, RouteEffect,
-    RouteExtension,
-};
-use claviron::http::ServiceResult;
 use claviron::http::policy::HttpPolicyOverride;
+use claviron::http::{RouteBody, ServiceResult};
+use claviron::pipeline::factory::{
+    BackendContext, BackendFactory, BackendPlacement,
+};
+use claviron::pipeline::{
+    BackendContract, BackendHandler, BackendIdentity, BackendReply,
+    DispatchCall, DispatchStep, HostContext,
+};
 use claviron::runtime::AppState;
 use claviron::runtime::registry::{Error, Result};
+use http::Request;
 
 use super::JavaScriptRouteConfig;
 use crate::{JsApplicationAdapter, JsApplicationService};
 
-/// Bind a host route prefix to an application prepared from `js.yaml`.
-/// Parsing and service resolution happen only during host preparation.
+/// Prepare a named JavaScript application after native Static/TryFiles.
+/// The pipeline exports request identity and policy at the backend handoff.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct JsRouteExtension;
+pub struct JsBackendFactory;
 
-impl RouteExtension for JsRouteExtension {
+impl BackendFactory for JsBackendFactory {
     fn name(&self) -> &'static str {
         "js"
     }
 
-    fn resolve(
+    fn placement(&self) -> BackendPlacement {
+        BackendPlacement::AfterFiles
+    }
+
+    fn prepare(
         &self,
-        context: &RouteContext<'_>,
-        source: &serde_yaml::Value,
-    ) -> Result<RouteEffect> {
+        context: &BackendContext<'_>,
+    ) -> Result<Vec<Arc<dyn BackendHandler>>> {
+        let Some(source) =
+            context.route.directive("js").filter(|value| !value.is_null())
+        else {
+            return Ok(Vec::new());
+        };
         let compile = || {
             let config = parse(source)?;
             let service = context
@@ -59,52 +71,52 @@ impl RouteExtension for JsRouteExtension {
                     "WebSocket routes require the websocket feature",
                 ));
             }
-            Ok(RouteEffect::Handler(Arc::new(JsHostHandler {
-                adapter,
-                #[cfg(feature = "websocket")]
-                sockets: SocketRoutes::prepare(context, &config, service)?,
-            })))
+            let mut owners: Vec<Arc<dyn BackendHandler>> = Vec::new();
+            #[cfg(feature = "websocket")]
+            if let Some(sockets) =
+                SocketRoutes::prepare(context, &config, service)?
+            {
+                owners.push(Arc::new(sockets));
+            }
+            owners.push(Arc::new(JsBackend { adapter }));
+            Ok(owners)
         };
-        compile().map_err(|error| {
-            Error::msg(format!(
-                "host '{}' route '{}' directive 'js': {error}",
-                context.host, context.prefix
-            ))
+        compile().map_err(|error| match context.host {
+            Some(host) => Error::msg(format!(
+                "host '{host}' route '{}' directive 'js': {error}",
+                context.prefix
+            )),
+            None => Error::msg(format!(
+                "route '{}' directive 'js': {error}",
+                context.prefix
+            )),
         })
     }
 }
 
-struct JsHostHandler {
+struct JsBackend {
     adapter: JsApplicationAdapter,
-    #[cfg(feature = "websocket")]
-    sockets: Option<Arc<SocketRoutes>>,
 }
 
-impl HostHandler for JsHostHandler {
+impl DispatchStep for JsBackend {
     fn call(
         &self,
-        request: HostRequest,
-    ) -> HostHandlerFuture {
+        request: Request<RouteBody>,
+        _context: Option<HostContext<'_>>,
+    ) -> DispatchCall {
         let adapter = self.adapter.clone();
-        #[cfg(feature = "websocket")]
-        let sockets = self.sockets.clone();
-        Box::pin(async move {
-            // Edge selected this prefix. Move the admitted request and unread
-            // body directly to the application, without an Axum router.
-            let request = request.into_request();
-            #[cfg(feature = "websocket")]
-            let request = if let Some(sockets) = sockets {
-                match sockets.dispatch(request).await {
-                    ServiceResult::Handled(response) => {
-                        return ServiceResult::Handled(response);
-                    }
-                    ServiceResult::Unhandled(request) => request,
-                }
-            } else {
-                request
-            };
+        DispatchCall::new(async move {
             ServiceResult::Handled(adapter.handle(request).await)
         })
+    }
+}
+
+impl BackendHandler for JsBackend {
+    fn contract(&self) -> BackendContract {
+        BackendContract {
+            identity: BackendIdentity::Request,
+            reply: BackendReply::Owner,
+        }
     }
 }
 
@@ -120,7 +132,7 @@ fn parse(source: &serde_yaml::Value) -> Result<JavaScriptRouteConfig> {
 
 pub(crate) fn register(state: &AppState) -> Result<()> {
     if let Some(hosts) = state.registry_ref().resolve::<HostAppRegistry>() {
-        hosts.register_route_extension(Arc::new(JsRouteExtension))?;
+        hosts.register_backend_factory(Arc::new(JsBackendFactory))?;
     }
     Ok(())
 }
@@ -134,24 +146,33 @@ struct SocketRoutes {
         claviron::websocket::H1UpgradeBinding,
     >,
     handler: Arc<crate::JsWebSocketUpgradeHandler>,
+    h1_enabled: bool,
     h2_enabled: bool,
 }
 
 #[cfg(feature = "websocket")]
 impl SocketRoutes {
     fn prepare(
-        context: &RouteContext<'_>,
+        context: &BackendContext<'_>,
         config: &JavaScriptRouteConfig,
         service: Arc<JsApplicationService>,
-    ) -> Result<Option<Arc<Self>>> {
-        if config.websockets().is_empty() {
+    ) -> Result<Option<Self>> {
+        if config.websockets().is_empty()
+            || context.protocol
+                == Some(claviron::pipeline::factory::RouteProtocol::Quic)
+        {
             return Ok(None);
         }
-        if !context.config.transport.h1.upgrade {
+        let h1_enabled = context.transport.h1.upgrade;
+        let h2_enabled = context.transport.h2.connect_protocol;
+        if !h1_enabled && !h2_enabled {
             return Err(Error::msg(
-                "WebSocket routes require transport.h1.upgrade: true",
+                "WebSocket routes require transport.h1.upgrade or transport.h2.connect_protocol",
             ));
         }
+        let host = context.host.ok_or_else(|| Error::msg(
+            "WebSocket routes require a virtual host for native session bindings",
+        ))?;
         let registry = claviron::websocket::H1UpgradeRegistry::default();
         let handler = Arc::new(crate::JsWebSocketUpgradeHandler::new(
             service,
@@ -159,46 +180,68 @@ impl SocketRoutes {
         ));
         for websocket in config.websockets() {
             registry.register_handler(
-                context.host.clone(),
+                host.clone(),
                 mounted_path(context.prefix, &websocket.path),
                 handler.clone(),
             )?;
         }
-        Ok(Some(Arc::new(Self {
+        Ok(Some(Self {
             state: context.state.clone(),
-            host: context.host.clone(),
-            paths: registry.snapshot_for_host(context.host),
+            host: host.clone(),
+            paths: registry.snapshot_for_host(host),
             handler,
-            h2_enabled: context.config.transport.h2.connect_protocol,
-        })))
+            h1_enabled,
+            h2_enabled,
+        }))
     }
+}
 
-    async fn dispatch(
+#[cfg(feature = "websocket")]
+impl DispatchStep for SocketRoutes {
+    fn call(
         &self,
-        request: http::Request<claviron::http::RouteBody>,
-    ) -> ServiceResult<
-        claviron::http::RouteResponse,
-        http::Request<claviron::http::RouteBody>,
-    > {
+        request: Request<RouteBody>,
+        _context: Option<HostContext<'_>>,
+    ) -> DispatchCall {
         let Some(binding) = self.paths.get(request.uri().path()) else {
-            return ServiceResult::Unhandled(request);
+            return DispatchCall::ready(ServiceResult::Unhandled(request));
         };
         if request.version() == http::Version::HTTP_2
             && request.method() == http::Method::CONNECT
         {
-            return ServiceResult::Handled(if self.h2_enabled {
-                self.handler.handle_connect(self.state.clone(), request).await
-            } else {
-                claviron::http::err_status(http::StatusCode::FORBIDDEN)
+            if !self.h2_enabled {
+                return DispatchCall::ready(ServiceResult::Handled(
+                    claviron::http::err_status(http::StatusCode::FORBIDDEN),
+                ));
+            }
+            let handler = Arc::clone(&self.handler);
+            let state = self.state.clone();
+            return DispatchCall::new(async move {
+                ServiceResult::Handled(
+                    handler.handle_connect(state, request).await,
+                )
             });
         }
-        claviron::websocket::try_h1_upgrade(
-            self.state.clone(),
-            self.host.clone(),
-            binding.clone(),
-            request,
-        )
-        .await
+        if !self.h1_enabled {
+            return DispatchCall::ready(ServiceResult::Unhandled(request));
+        }
+        let state = self.state.clone();
+        let host = self.host.clone();
+        let binding = binding.clone();
+        DispatchCall::new(async move {
+            claviron::websocket::try_h1_upgrade(state, host, binding, request)
+                .await
+        })
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl BackendHandler for SocketRoutes {
+    fn contract(&self) -> BackendContract {
+        BackendContract {
+            identity: BackendIdentity::Request,
+            reply: BackendReply::Owner,
+        }
     }
 }
 

@@ -1,6 +1,10 @@
 use super::*;
-use claviron::edge::{Host, HostConfig};
+use claviron::edge::Host;
+use claviron::http::config::transport::TransportPolicy;
 use claviron::http::ext::PathPrefix;
+use claviron::http::policy::HttpPolicy;
+use claviron::pipeline::Site;
+use claviron::pipeline::factory::RouteProtocol;
 
 fn prefix(value: &str) -> PathPrefix {
     serde_yaml::from_value(serde_yaml::Value::String(value.into())).unwrap()
@@ -18,57 +22,103 @@ fn configured_state() -> AppState {
             crate::ApplicationDefinition::new("example", "/app.js").unwrap(),
         )
         .unwrap();
-    // DI only: compilation needs declarations, not an executing V8 pool.
+    // Preparation resolves declarations without starting a V8 pool.
     state.registry_ref().insert(service).unwrap();
     state
 }
 
 #[test]
-fn registration_uses_the_existing_edge_registry_and_preserves_plain_axum_consumers()
- {
+fn registration_preserves_plain_consumers_and_installs_one_backend_factory() {
     let state = AppState::standalone("js-route-test", ".");
     register(&state).unwrap();
     state.registry_ref().insert(Arc::new(HostAppRegistry::default())).unwrap();
     register(&state).unwrap();
-    // The registry's existing duplicate guard proves that the `js` codec was
-    // installed; registration neither boots a host nor starts an application.
     let error = register(&state).unwrap_err().to_string();
-    assert!(error.contains("route extension 'js' is already registered"));
+    assert!(error.contains("backend 'js' is already registered"));
 }
 
-fn resolve(
+fn prepare(
     state: &AppState,
-    host: &HostConfig,
+    host: Option<&Host>,
+    transport: &TransportPolicy,
+    protocol: RouteProtocol,
+    value: Option<&str>,
+) -> Result<Vec<Arc<dyn BackendHandler>>> {
+    let mut site = Site::new(".");
+    if let Some(value) = value {
+        site.extensions.insert("js".into(), source(value));
+    }
+    JsBackendFactory.prepare(&BackendContext {
+        state,
+        host,
+        site: &site,
+        route: &site,
+        prefix: &prefix("/api"),
+        policy: HttpPolicy::unlimited(),
+        transport,
+        protocol: Some(protocol),
+        listener: None,
+    })
+}
+
+fn compile(
+    state: &AppState,
+    transport: &str,
     value: &str,
-) -> Result<RouteEffect> {
-    JsRouteExtension.resolve(
-        &RouteContext {
-            state,
-            host: &"example.test".parse::<Host>().unwrap(),
-            config: host,
-            route: host,
-            prefix: &prefix("/api"),
-        },
-        &source(value),
+) -> Result<Vec<Arc<dyn BackendHandler>>> {
+    prepare(
+        state,
+        Some(&"example.test".parse().unwrap()),
+        &serde_yaml::from_str(transport).unwrap(),
+        RouteProtocol::Http,
+        Some(value),
     )
 }
 
 #[test]
-fn compiles_a_declared_application_without_starting_the_engine() {
+fn compiles_a_declared_application_with_backend_identity_and_no_engine_start() {
     let state = configured_state();
-    let host: HostConfig = serde_yaml::from_str("{}").unwrap();
-    assert!(matches!(
-        resolve(&state, &host, "application: example").unwrap(),
-        RouteEffect::Handler(_)
-    ));
+    let owners = compile(&state, "{}", "application: example").unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].contract().identity, BackendIdentity::Request);
+    assert!(matches!(owners[0].contract().reply, BackendReply::Owner));
+    assert_eq!(JsBackendFactory.placement(), BackendPlacement::AfterFiles);
 }
 
 #[test]
-fn rejects_unknown_applications_during_compilation_with_host_and_route_context()
-{
-    let state = configured_state();
-    let host: HostConfig = serde_yaml::from_str("{}").unwrap();
-    let error = resolve(&state, &host, "application: missing")
+fn absent_or_null_directive_needs_no_service_and_creates_no_owner() {
+    let state = AppState::standalone("js-route-test", ".");
+    for value in [None, Some("null")] {
+        assert!(
+            prepare(
+                &state,
+                None,
+                &TransportPolicy::default(),
+                RouteProtocol::Http,
+                value
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn fetch_backend_does_not_require_a_virtual_host() {
+    let owners = prepare(
+        &configured_state(),
+        None,
+        &TransportPolicy::default(),
+        RouteProtocol::Http,
+        Some("application: example"),
+    )
+    .unwrap();
+    assert_eq!(owners.len(), 1);
+}
+
+#[test]
+fn rejects_unknown_applications_with_host_and_route_context() {
+    let error = compile(&configured_state(), "{}", "application: missing")
         .err()
         .unwrap()
         .to_string();
@@ -78,10 +128,9 @@ fn rejects_unknown_applications_during_compilation_with_host_and_route_context()
 }
 
 #[test]
-fn rejects_missing_service_during_compilation() {
+fn rejects_missing_service_during_preparation() {
     let state = AppState::standalone("js-route-test", ".");
-    let host: HostConfig = serde_yaml::from_str("{}").unwrap();
-    let error = resolve(&state, &host, "application: example")
+    let error = compile(&state, "{}", "application: example")
         .err()
         .unwrap()
         .to_string();
@@ -117,36 +166,89 @@ fn websocket_paths_are_relative_to_the_selected_mount() {
 
 #[cfg(feature = "websocket")]
 #[test]
-fn websocket_compilation_requires_the_transport_gate_and_rejects_duplicates() {
+fn websocket_preparation_uses_effective_transport_and_rejects_duplicates() {
     let state = configured_state();
-    let closed: HostConfig = serde_yaml::from_str("{}").unwrap();
     let declaration = "application: example\nwebsocket: { path: /socket }";
-    let error =
-        resolve(&state, &closed, declaration).err().unwrap().to_string();
+    let error = compile(&state, "{}", declaration).err().unwrap().to_string();
     assert!(error.contains("transport.h1.upgrade"));
 
-    let open: HostConfig =
-        serde_yaml::from_str("transport: { h1: { upgrade: true } }").unwrap();
-    assert!(matches!(
-        resolve(&state, &open, declaration).unwrap(),
-        RouteEffect::Handler(_)
+    for open in ["h1: { upgrade: true }", "h2: { connect_protocol: true }"] {
+        let owners = compile(&state, open, declaration).unwrap();
+        assert_eq!(owners.len(), 2);
+        let duplicates = "application: example\nwebsockets: [{ path: /socket }, { path: /socket/ }]";
+        let error =
+            compile(&state, open, duplicates).err().unwrap().to_string();
+        assert!(error.contains("duplicate H1 upgrade binding"));
+        assert!(compile(&state, open, declaration).is_ok());
+    }
+}
+
+#[cfg(feature = "websocket")]
+#[test]
+fn quic_prepares_fetch_without_tcp_websocket_owners() {
+    let owners = prepare(
+        &configured_state(),
+        None,
+        &TransportPolicy::default(),
+        RouteProtocol::Quic,
+        Some("application: example\nwebsocket: { path: /socket }"),
+    )
+    .unwrap();
+    assert_eq!(owners.len(), 1);
+}
+
+#[cfg(feature = "websocket")]
+#[test]
+fn socket_miss_returns_the_same_unread_request_synchronously() {
+    struct Unread;
+    impl http_body::Body for Unread {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Option<
+                std::result::Result<http_body::Frame<Self::Data>, Self::Error>,
+            >,
+        > {
+            panic!("socket selection must not read the body")
+        }
+    }
+    let state = configured_state();
+    let owners = compile(
+        &state,
+        "h1: { upgrade: true }",
+        "application: example\nwebsocket: { path: /socket }",
+    )
+    .unwrap();
+    let body = claviron::http::boxed_body(Unread);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/fetch?q=1")
+        .body(body)
+        .unwrap();
+    let marker = Arc::new(());
+    request.extensions_mut().insert(Arc::clone(&marker));
+    let DispatchCall::Ready(ServiceResult::Unhandled(request)) =
+        owners[0].call(request, None)
+    else {
+        panic!("a socket miss must return the request inline");
+    };
+    assert_eq!(request.uri(), "/api/fetch?q=1");
+    assert_eq!(request.method(), "POST");
+    assert!(Arc::ptr_eq(
+        request.extensions().get::<Arc<()>>().unwrap(),
+        &marker
     ));
-    let duplicates = "application: example\nwebsockets: [{ path: /socket }, { path: /socket/ }]";
-    let error = resolve(&state, &open, duplicates).err().unwrap().to_string();
-    assert!(error.contains("duplicate H1 upgrade binding"));
-    // Each candidate owns fresh bindings; re-preparing the same declaration
-    // never collides with the previous snapshot or a failed candidate.
-    assert!(resolve(&state, &open, declaration).is_ok());
 }
 
 #[cfg(not(feature = "websocket"))]
 #[test]
-fn websocket_declarations_are_not_silently_ignored_without_support() {
-    let state = configured_state();
-    let host: HostConfig = serde_yaml::from_str("{}").unwrap();
-    let error = resolve(
-        &state,
-        &host,
+fn websocket_declarations_require_support() {
+    let error = compile(
+        &configured_state(),
+        "{}",
         "application: example\nwebsocket: { path: /socket }",
     )
     .err()

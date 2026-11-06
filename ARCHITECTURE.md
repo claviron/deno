@@ -41,12 +41,12 @@ Deno CLI/runtime environment.
 - `routing` uses the same `server` feature and owns Axum mounting, its typed
   JavaScript mount declarations and dispatch. Its builder never needs Edge's
   HostConfig or a JS feature in Claviron.
-- The optional `edge` feature compiles `js:` into a native HostPipeline handler.
-  The admitted request and unread body move directly into the application
-  adapter; this path does not construct an Axum router. Optional WebSocket
-  endpoints use the same snapshot-owned bindings and listener session owner.
-  It is a topology boundary, not another engine: plain Axum consumers do not
-  acquire Edge. Claviron and Edge retain no dependency on this Deno crate.
+- The optional `edge` feature registers `routing::edge::JsBackendFactory`.
+  It prepares `js:` owners after native Static/TryFiles. The common backend
+  handoff exports policy and connection identity before the admitted request
+  and unread body enter the adapter. WebSocket owners exist only for declared
+  endpoints on TCP listeners; sessions remain listener-owned. This path builds
+  no Axum router. Plain Axum consumers do not acquire Edge.
 - `backend::deno` is a hidden native extension seam. Deno and V8 types stay
   behind it rather than becoming the downstream application contract.
 
@@ -401,13 +401,15 @@ Longer application prefixes win. Explicit static mounts remain outside
 application layers, so a frontend can be served directly while `/api` is
 handled by JavaScript.
 
-With `edge`, the same `register(state)` installs `routing::edge::JsRouteExtension`
-in the existing `HostAppRegistry` when that registry is present. It compiles
-the `js:` directive at host snapshot preparation, capturing the declared
-application service and request/response policy in the router. No YAML parse,
-service lookup or additional prefix selection occurs during HTTP dispatch.
-An unregistered service, undeclared application, typo or duplicate application
-owner fails snapshot preparation; no alternative application is manufactured.
+With `edge`, `register(state)` installs `routing::edge::JsBackendFactory`
+in an existing `HostAppRegistry`. The factory resolves `js:` at snapshot
+preparation and places its owners after Static/TryFiles. An absent or null
+directive installs nothing. An unknown application or invalid declaration fails
+preparation. Fetch owners also support a host-independent site. Dispatch moves
+the original body into the adapter without parsing configuration or resolving
+services. Each owner declares `BackendIdentity::Request` and `BackendReply::Owner`:
+the pipeline exports effective policy and connection facts, while the JavaScript
+service owns response completion and drain.
 The route map owns the prefix, so `path` inside the directive is rejected:
 
 ```yaml
@@ -425,22 +427,20 @@ example.test:
           - path: /socket
 ```
 
-Flat `js: { application: example }` binds the implicit `/` owner. With the
-`websocket` feature, declared exact endpoints are mounted relative to that
-owner (`/api/socket` above). The compiler wraps its router with the existing
-Claviron H1 upgrade middleware and a candidate-local registry. The same exact
-bindings accept H2 WebSockets when `transport.h2.connect_protocol` is enabled.
-The H2 hand-off is local to this router snapshot, preserving its ordinary
-policy layers; no live global CONNECT binding is mutated during preparation.
-Failed or repeated preparation never mutates live bindings. Extended CONNECT
-must carry protocol `websocket` and WebSocket version 13; it returns 200 with
-no H1 upgrade/accept headers. Its method and URI are never rewritten for Fetch.
-Both entrances reserve an instance through `prepare_websocket` and run the same
-WebSocket event/frame loop through the listener's `SessionSpawner`. Native drain
-sends close 1001; no private deadline or detached task is introduced.
-WebSocket declarations without the feature or without `transport.h1.upgrade`
-fail preparation rather than being ignored. This directive does not register
-H3 WebTransport endpoints.
+Flat `js: { application: example }` selects the implicit `/` scope. With
+`websocket`, exact endpoints are relative to that scope (`/api/socket` above).
+The factory prepares a separate WebSocket owner before Fetch, using the
+listener's effective H1 upgrade and H2 CONNECT policy. An unmatched path returns
+the unread request synchronously. No socket owner is installed without endpoint
+declarations, or for QUIC. TCP declarations require H1 upgrade or H2 CONNECT
+support and a virtual host for native session bindings. Candidate-local bindings
+leave live sessions unchanged on failed or repeated preparation.
+
+H2 extended CONNECT must carry protocol `websocket` and version 13. It returns
+200 without H1 upgrade headers; method and URI are not rewritten for Fetch.
+Both entrances reserve an instance through `prepare_websocket` and use the
+listener's `SessionSpawner`. Drain sends close 1001. This backend does not
+register H3 WebTransport endpoints.
 
 The service is registered only on workers and standalone processes; the master
 is not a JavaScript placement. Stop drains each mailbox, invokes the optional

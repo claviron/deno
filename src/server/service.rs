@@ -915,7 +915,7 @@ pub(crate) fn configured_extensions(
                 .with_link_interest(
                     _state
                         .registry_ref()
-                        .resolve::<claviron::orbit::transport::LinkInterest>(),
+                        .resolve::<claviron::orbit::link::LinkInterest>(),
                 )
                 .with_cells(
                     _state

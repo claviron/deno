@@ -8,7 +8,7 @@ use super::{
 use claviron::app::{
     ApplicationEvent, ApplicationId, ApplicationName, ApplicationRuntime,
 };
-use claviron::orbit::transport::LinkInterest;
+use claviron::orbit::link::LinkInterest;
 use claviron::runtime::ProcessEventBus;
 use std::sync::Arc;
 
