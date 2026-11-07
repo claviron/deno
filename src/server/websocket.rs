@@ -44,20 +44,17 @@ impl JsWebSocketUpgradeHandler {
         state: AppState,
         request: Request<claviron::http::RouteBody>,
     ) -> claviron::http::RouteResponse {
+        use claviron::http::err_status;
         use claviron::http::session::SessionSpawner;
-        use claviron::http::{empty_body, err_status};
         use http::StatusCode;
 
-        if !request.extensions().get::<hyper::ext::Protocol>().is_some_and(
-            |protocol| protocol.as_str().eq_ignore_ascii_case("websocket"),
-        ) || request
-            .headers()
-            .get(http::header::SEC_WEBSOCKET_VERSION)
-            .and_then(|value| value.to_str().ok())
-            != Some("13")
-        {
+        let Some(offer) = request
+            .extensions()
+            .get::<claviron::http::socket::Offer>()
+            .cloned()
+        else {
             return err_status(StatusCode::BAD_REQUEST);
-        }
+        };
         let Some(sessions) =
             request.extensions().get::<SessionSpawner>().cloned()
         else {
@@ -88,19 +85,17 @@ impl JsWebSocketUpgradeHandler {
             }
         };
         let headers = header_pairs(&parts.headers);
-        let request = Request::from_parts(parts, body);
-        let owner = sessions.clone();
-        let submitted = sessions.spawn(async move {
-            let upgraded = tokio::select! {
-                biased;
-                _ = owner.wait_graceful_shutdown() => return,
-                result = hyper::upgrade::on(request) => match result {
-                    Ok(upgraded) => upgraded,
-                    Err(error) => {
-                        debug!(%error, "JavaScript H2 CONNECT upgrade failed");
-                        return;
-                    }
-                }
+        drop(body);
+        let Some(claim) = offer.claim() else {
+            return err_status(StatusCode::BAD_REQUEST);
+        };
+        // The door commits the handshake: extended CONNECT's 200 here.
+        claim.accept_with(move |io| async move {
+            let claviron::http::socket::SocketIo::Stream(upgraded) = io else {
+                debug!(
+                    "a JavaScript WebSocket has no use for this session's I/O"
+                );
+                return;
             };
             let _session = claviron::runtime::activity::ACTIVITY.open_session();
             if let Err(error) = serve_websocket_with_shutdown(
@@ -109,22 +104,13 @@ impl JsWebSocketUpgradeHandler {
                 url,
                 headers,
                 lease,
-                owner.wait_graceful_shutdown(),
+                sessions.wait_graceful_shutdown(),
             )
             .await
             {
                 debug!(%error, "JavaScript H2 WebSocket ended with an error");
             }
-        });
-        if let Err(error) = submitted {
-            debug!(%error, "JavaScript CONNECT session hand-off rejected");
-            return err_status(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        // Extended CONNECT uses 200, not 101, and has no H1 accept/key headers.
-        http::Response::builder()
-            .status(StatusCode::OK)
-            .body(empty_body())
-            .expect("static CONNECT response")
+        })
     }
 }
 

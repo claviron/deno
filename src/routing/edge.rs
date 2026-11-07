@@ -132,7 +132,7 @@ fn parse(source: &serde_yaml::Value) -> Result<JavaScriptRouteConfig> {
 
 pub(crate) fn register(state: &AppState) -> Result<()> {
     if let Some(hosts) = state.registry_ref().resolve::<HostAppRegistry>() {
-        hosts.register_backend_factory(Arc::new(JsBackendFactory))?;
+        hosts.site().register_backend(Arc::new(JsBackendFactory))?;
     }
     Ok(())
 }
