@@ -245,7 +245,7 @@ impl ApplicationPool {
             dispatch,
             limits,
             retry,
-            admission: Arc::new(Semaphore::new(limits.max_waiting())),
+            admission: Arc::new(Semaphore::new(limits.max_in_flight())),
             boot,
             last_error: Mutex::new(None),
             #[cfg(feature = "websocket")]

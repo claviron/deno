@@ -316,7 +316,7 @@ stop/start path. Stopped applications retain their stopped state and use the
 latest valid values on their next start; invalid sources retain live execution.
 `engine.command_queue_capacity` bounds only the non-HTTP commands waiting in
 each isolate's mailbox and defaults to 64. HTTP dispatch enters the same FIFO
-without reserving a second capacity permit: the application's `max_waiting`
+without reserving a second capacity permit: the application's `max_in_flight`
 already bounds these requests until guest completion. Taking a control command
 from the mailbox releases its capacity permit; its callback may remain active.
 `engine.websocket` carries the transport limits the runtime applies around a
@@ -330,7 +330,7 @@ one application is dispatched. `config/js.yaml` spells out every accepted key
 at its default value, so the whole surface is readable without the schema. Every application separately declares its fixed
 request `dispatch` algorithm and execution limits. `round_robin` selects the
 next live instance without allocating a temporary list on each dispatch.
-`max_waiting` bounds queued and executing requests, including live response
+`max_in_flight` bounds admitted requests, including live response
 producers after their headers have been sent; its owned permit is released with
 actual guest completion. `requests.queue_timeout` bounds the wait for the
 isolate owner's acknowledgement, including time queued behind earlier commands.

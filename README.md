@@ -49,7 +49,7 @@ standard `status()`, `headers()` and body methods. HTTP parts move through the
 mailbox without rebuilding method/header strings. Metadata crosses into V8 as
 native values, with no JSON head encoding or parsing.
 
-`max_waiting` bounds accepted requests, including unfinished response producers.
+`max_in_flight` bounds accepted requests, including unfinished response producers.
 HTTP requests enter the isolate's mailbox using that admission permit alone.
 `engine.command_queue_capacity` bounds only queued non-HTTP commands, such as
 application events, WebSocket events and shutdown. They share the HTTP FIFO;

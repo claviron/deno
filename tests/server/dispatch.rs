@@ -84,7 +84,7 @@ fn dispatch_pool(
         dispatch: ApplicationDispatch::RoundRobin,
         limits,
         retry: default_retry_policy(),
-        admission: Arc::new(Semaphore::new(limits.max_waiting())),
+        admission: Arc::new(Semaphore::new(limits.max_in_flight())),
         boot: WorkerBoot::new(
             definition,
             Arc::from([]),

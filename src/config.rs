@@ -51,7 +51,7 @@ impl JsConfig {
             (
                 application.dispatch,
                 ApplicationLimits::new(
-                    application.max_waiting,
+                    application.max_in_flight,
                     application.execution_timeout,
                 ),
                 application.retry.policy(),
@@ -87,14 +87,15 @@ impl JsConfig {
         for (name, application) in &self.applications {
             if application.requests.is_some() {
                 return Err(format!(
-                    "js.yaml applications.{name}.requests is gone: max_waiting and execution_timeout go directly under the application; dispatch_queue_timeout is requests.queue_timeout, written on the route that selects it"
+                    "js.yaml applications.{name}.requests is gone: max_in_flight and execution_timeout go directly under the application; dispatch_queue_timeout is requests.queue_timeout, written on the route that selects it"
                 ));
             }
-            if application.max_waiting == 0
-                || application.max_waiting > tokio::sync::Semaphore::MAX_PERMITS
+            if application.max_in_flight == 0
+                || application.max_in_flight
+                    > tokio::sync::Semaphore::MAX_PERMITS
             {
                 return Err(format!(
-                    "js.yaml applications.{name}.max_waiting must be between 1 and {}",
+                    "js.yaml applications.{name}.max_in_flight must be between 1 and {}",
                     tokio::sync::Semaphore::MAX_PERMITS
                 ));
             }
@@ -121,7 +122,7 @@ pub struct EngineConfig {
     pub fetch: FetchConfig,
     pub websocket: WebSocketConfig,
     /// Non-HTTP commands waiting for an application isolate owner.
-    /// HTTP requests are bounded only by the application's `max_waiting`.
+    /// HTTP requests are bounded only by the application's `max_in_flight`.
     #[serde(default = "default_command_queue_capacity")]
     pub command_queue_capacity: usize,
     /// How long a stopping isolate may take to finish the work it already
@@ -189,50 +190,92 @@ impl Default for FetchConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "ApplicationFields")]
 pub struct ApplicationConfig {
     pub module: PathBuf,
+    pub frameworks: Option<Vec<String>>,
+    pub icon: Option<String>,
+    pub instances: usize,
+    pub dispatch: ApplicationDispatch,
+    /// Requests admitted at once, including live response producers.
+    pub max_in_flight: usize,
+    /// Budget from acceptance to the response head; `null` leaves it unbounded.
+    /// Expiry cancels this request cooperatively through its AbortSignal and
+    /// bridge I/O. It never terminates other calls in the shared isolate.
+    /// The wait for acceptance is the route's `requests.queue_timeout`.
+    pub execution_timeout: Option<Duration>,
+    /// Removed; read only to say where each field went.
+    pub requests: Option<Ignored>,
+    pub retry: ApplicationRetryConfig,
+    /// This application's own drain deadline. `null`/omitted inherits
+    /// `engine.graceful_timeout`, which itself defaults to waiting
+    /// indefinitely.
+    pub graceful_timeout: Option<Duration>,
+    pub env: BTreeMap<String, String>,
+    pub env_file: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationFields {
+    module: PathBuf,
     #[serde(
         default,
         alias = "framework",
         deserialize_with = "claviron::helpers::de::opt_one_or_many"
     )]
-    pub frameworks: Option<Vec<String>>,
+    frameworks: Option<Vec<String>>,
     #[serde(default)]
-    pub icon: Option<String>,
+    icon: Option<String>,
     #[serde(default = "default_instances")]
-    pub instances: usize,
+    instances: usize,
     #[serde(default)]
-    pub dispatch: ApplicationDispatch,
-    /// Requests admitted at once, including live response producers.
-    #[serde(default = "default_max_waiting")]
-    pub max_waiting: usize,
-    /// Budget from acceptance to the response head; `null` leaves it unbounded.
-    /// Expiry cancels this request cooperatively through its AbortSignal and
-    /// bridge I/O. It never terminates other calls in the shared isolate.
-    /// The wait for acceptance is the route's `requests.queue_timeout`.
+    dispatch: ApplicationDispatch,
+    #[serde(default = "default_max_in_flight")]
+    max_in_flight: usize,
+    #[serde(
+        default,
+        rename = "max_waiting",
+        deserialize_with = "reject_max_waiting"
+    )]
+    _retired_max_waiting: (),
     #[serde(
         default = "default_execution_timeout",
         deserialize_with = "claviron::helpers::de::deserialize_optional_duration"
     )]
-    pub execution_timeout: Option<Duration>,
-    /// Removed; read only to say where each field went.
+    execution_timeout: Option<Duration>,
     #[serde(default)]
-    pub requests: Option<Ignored>,
+    requests: Option<Ignored>,
     #[serde(default)]
-    pub retry: ApplicationRetryConfig,
-    /// This application's own drain deadline. `null`/omitted inherits
-    /// `engine.graceful_timeout`, which itself defaults to waiting
-    /// indefinitely.
+    retry: ApplicationRetryConfig,
     #[serde(
         default,
         deserialize_with = "claviron::helpers::de::deserialize_optional_duration"
     )]
-    pub graceful_timeout: Option<Duration>,
+    graceful_timeout: Option<Duration>,
     #[serde(default, alias = "environment")]
-    pub env: BTreeMap<String, String>,
+    env: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "claviron::helpers::de::one_or_many")]
-    pub env_file: Vec<PathBuf>,
+    env_file: Vec<PathBuf>,
+}
+
+impl From<ApplicationFields> for ApplicationConfig {
+    fn from(fields: ApplicationFields) -> Self {
+        Self {
+            module: fields.module,
+            frameworks: fields.frameworks,
+            icon: fields.icon,
+            instances: fields.instances,
+            dispatch: fields.dispatch,
+            max_in_flight: fields.max_in_flight,
+            execution_timeout: fields.execution_timeout,
+            requests: fields.requests,
+            retry: fields.retry,
+            graceful_timeout: fields.graceful_timeout,
+            env: fields.env,
+            env_file: fields.env_file,
+        }
+    }
 }
 
 /// When a failed instance is replaced. The same three keys PHP applications
@@ -372,10 +415,10 @@ pub(crate) fn default_retry_policy() -> ApplicationRetryPolicy {
 }
 
 pub(crate) fn default_limits() -> ApplicationLimits {
-    ApplicationLimits::new(default_max_waiting(), default_execution_timeout())
+    ApplicationLimits::new(default_max_in_flight(), default_execution_timeout())
 }
 
-fn default_max_waiting() -> usize {
+fn default_max_in_flight() -> usize {
     256
 }
 
@@ -496,5 +539,38 @@ impl Component<AppState> for JsConfigProvider {
 
     fn as_configurable(&self) -> Option<&dyn congif::ConfigRegistration> {
         Some(self)
+    }
+}
+
+fn reject_max_waiting<'de, D: serde::Deserializer<'de>>(
+    _: D
+) -> std::result::Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "max_waiting was removed; use max_in_flight: Deno starts admitted requests without a waiting queue",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_admission_has_no_waiting_queue() {
+        let config = serde_yaml::from_str::<ApplicationConfig>(
+            "{module: app.ts, max_in_flight: 4}",
+        )
+        .unwrap();
+        assert_eq!(config.max_in_flight, 4);
+        let error = serde_yaml::from_str::<ApplicationConfig>(
+            "{module: app.ts, max_waiting: null}",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("use max_in_flight"));
+        assert!(
+            serde_yaml::from_str::<ApplicationConfig>(
+                "{module: app.ts, max_queued: 4}",
+            )
+            .is_err()
+        );
     }
 }
