@@ -114,6 +114,9 @@ impl DispatchStep for JsBackend {
 impl BackendHandler for JsBackend {
     fn contract(&self) -> BackendContract {
         BackendContract {
+            execution: claviron::ExecutorSpec::Dedicated(
+                claviron::ExecutorKind::CurrentThread,
+            ),
             identity: BackendIdentity::Request,
             reply: BackendReply::Owner,
         }
@@ -239,6 +242,9 @@ impl DispatchStep for SocketRoutes {
 impl BackendHandler for SocketRoutes {
     fn contract(&self) -> BackendContract {
         BackendContract {
+            execution: claviron::ExecutorSpec::Dedicated(
+                claviron::ExecutorKind::CurrentThread,
+            ),
             identity: BackendIdentity::Request,
             reply: BackendReply::Owner,
         }
