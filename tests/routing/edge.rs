@@ -1,5 +1,5 @@
 use super::*;
-use claviron::edge::Host;
+use claviron_types::Host;
 use claviron::http::config::transport::TransportPolicy;
 use claviron::http::ext::PathPrefix;
 use claviron::http::policy::HttpPolicy;
@@ -28,12 +28,10 @@ fn configured_state() -> AppState {
 }
 
 #[test]
-fn registration_preserves_plain_consumers_and_installs_one_backend_factory() {
-    let state = AppState::standalone("js-route-test", ".");
-    register(&state).unwrap();
-    state.registry_ref().insert(Arc::new(HostAppRegistry::default())).unwrap();
-    register(&state).unwrap();
-    let error = register(&state).unwrap_err().to_string();
+fn registration_installs_one_backend_factory_in_a_site_registry() {
+    let site = claviron::pipeline::SiteRegistry::default();
+    register(&site).unwrap();
+    let error = register(&site).unwrap_err().to_string();
     assert!(error.contains("backend 'js' is already registered"));
 }
 

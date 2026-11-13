@@ -38,7 +38,7 @@ impl JsWebSocketUpgradeHandler {
 
     /// RFC 8441 on the same snapshot-owned route as the H1 upgrade. The
     /// admitted CONNECT stays CONNECT and never enters the Fetch adapter.
-    #[cfg(feature = "edge")]
+    #[cfg(feature = "backend")]
     pub(crate) async fn handle_connect(
         &self,
         state: AppState,

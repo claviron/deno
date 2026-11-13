@@ -1,3 +1,9 @@
-//! Internal backend support shared by Claviron's JavaScript engine crates.
+//! Compile site directives for embedded JavaScript applications.
 
+#[doc(hidden)]
 pub mod deno;
+
+#[cfg(feature = "backend")]
+mod site;
+#[cfg(feature = "backend")]
+pub use site::{JsBackendFactory, register};

@@ -1,8 +1,8 @@
 //! Slim embedded JavaScript applications for Claviron consumers.
 //!
 //! The public surface speaks in application concepts. The `deno_core` bridge
-//! is isolated under the hidden [`backend`] module so a full Deno backend can
-//! reuse Claviron extensions without exposing engine types to applications.
+//! is isolated so a full Deno backend can reuse Claviron extensions without
+//! exposing engine types to applications.
 
 mod application;
 #[cfg(feature = "server")]
@@ -15,7 +15,6 @@ pub mod routing;
 #[cfg(feature = "server")]
 mod server;
 
-#[doc(hidden)]
 pub mod backend;
 #[cfg(feature = "tasks")]
 pub mod task;

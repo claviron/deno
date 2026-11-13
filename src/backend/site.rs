@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use claviron::edge::HostAppRegistry;
 use claviron::http::policy::HttpPolicyOverride;
 use claviron::http::{RouteBody, ServiceResult};
 use claviron::pipeline::factory::{
@@ -12,11 +11,12 @@ use claviron::pipeline::{
     BackendContract, BackendHandler, BackendIdentity, BackendReply,
     DispatchCall, DispatchStep, HostContext,
 };
+#[cfg(any(feature = "websocket", test))]
 use claviron::runtime::AppState;
 use claviron::runtime::registry::{Error, Result};
 use http::Request;
 
-use super::JavaScriptRouteConfig;
+use crate::routing::JavaScriptRouteConfig;
 use crate::{JsApplicationAdapter, JsApplicationService};
 
 /// Prepare a named JavaScript application after native Static/TryFiles.
@@ -133,17 +133,15 @@ fn parse(source: &serde_yaml::Value) -> Result<JavaScriptRouteConfig> {
         .map_err(|error| Error::msg(error.to_string()))
 }
 
-pub(crate) fn register(state: &AppState) -> Result<()> {
-    if let Some(hosts) = state.registry_ref().resolve::<HostAppRegistry>() {
-        hosts.site().register_backend(Arc::new(JsBackendFactory))?;
-    }
-    Ok(())
+/// Install `js:` route preparation in the site's registry.
+pub fn register(registry: &claviron::pipeline::SiteRegistry) -> Result<()> {
+    registry.register_backend(Arc::new(JsBackendFactory))
 }
 
 #[cfg(feature = "websocket")]
 struct SocketRoutes {
     state: AppState,
-    host: claviron::edge::Host,
+    host: claviron_types::Host,
     paths: std::collections::HashMap<
         Arc<str>,
         claviron::websocket::H1UpgradeBinding,

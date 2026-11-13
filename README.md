@@ -77,13 +77,8 @@ packages, execute CommonJS or provide Node built-ins.
 
 ## Register with a host
 
-```toml
-[dependencies]
-claviron = { version = "0.2.0-alpha.25", default-features = false, features = ["edge"] }
-claviron-deno = { version = "0.2.0-alpha.25", features = ["edge"] }
-```
-
-In the host's registration callback:
+Enable `edge` and register the runtime in Edge's registration callback.
+This also installs the `js:` route factory.
 
 ```rust
 use claviron::runtime::{AppState, registry};
@@ -108,7 +103,7 @@ Relative module paths resolve from the process's working directory. Application
 environment values are explicit; the JavaScript environment is not an implicit
 view of the host process's environment. `env_file` can supply additional values.
 
-With the `edge` feature, a vhost route selects the named application:
+A site's `js:` directive selects the named application:
 
 ```yaml
 example.test:
@@ -131,7 +126,8 @@ the thread-local `CoreApplication` for hosts that manage execution themselves.
 | Feature | Adds |
 | --- | --- |
 | `server` | Managed application pools, `js.yaml`, lifecycle registration and Axum mounting. |
-| `edge` | `server` plus Claviron's `js:` vhost route extension. |
+| `backend` | `server` plus the `js:` factory for a site registry. |
+| `edge` | Registers the `js:` factory on Edge through `register(state)`. |
 | `websocket` | `server` plus inbound WebSocket callbacks over HTTP/1 Upgrade and HTTP/2 extended CONNECT. |
 | `orbit` | `server` plus fleet events, shared cells, counters, locks and invocation modules. |
 | `cache` | `server` plus access to Claviron cache stores. |

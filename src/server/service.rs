@@ -771,6 +771,7 @@ pub(crate) fn configured_fetch_root_cert_store(
     }
 }
 
+/// Register the managed runtime and, with `edge`, its site directive on Edge.
 pub fn register(state: &AppState) -> registry::Result<()> {
     #[cfg(feature = "orbit")]
     {
@@ -834,7 +835,9 @@ pub fn register(state: &AppState) -> registry::Result<()> {
 
     state.registry_ref().register(service)?;
     #[cfg(feature = "edge")]
-    crate::routing::edge::register(state)?;
+    if let Some(hosts) = state.registry_ref().resolve::<claviron::edge::HostAppRegistry>() {
+        crate::backend::register(hosts.site())?;
+    }
     Ok(())
 }
 

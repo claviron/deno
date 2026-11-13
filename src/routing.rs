@@ -17,7 +17,9 @@ mod config;
 pub use config::{JavaScriptRouteConfig, JavaScriptWebSocketConfig};
 
 #[cfg(feature = "edge")]
-pub mod edge;
+pub mod edge {
+    pub use crate::backend::JsBackendFactory;
+}
 
 /// Prepare configured mounts once, with the most specific prefix outermost.
 pub fn build_router(
